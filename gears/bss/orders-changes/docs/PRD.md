@@ -251,9 +251,11 @@ The order line **MUST** be able to express which plan-scoped **add-ons** were se
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-changes-fr-chg-target-eligibility`
 
-At submit, the target subscription **MUST** be non-terminal, **MUST** resolve under the same tenant axes as the change order (`resourceTenantId`, `payerTenantId`, `sellerTenantId`), and **MUST NOT** have another change order in flight against it. The eligibility check **MUST** be repeated immediately before the increase is applied; a target that has become ineligible in the meantime **MUST** fail the change order with a machine-readable reason and **MUST NOT** be partially modified.
+At submit, the target subscription **MUST** be non-terminal, **MUST** resolve under the same tenant axes as the change order (`resourceTenantId`, `payerTenantId`, `sellerTenantId`), and **MUST NOT** have another change order in flight against it. The submit-time read **MUST** capture the target's **revision identifier** — the version or composition token Subscriptions exposes for optimistic concurrency — and the change order **MUST** record it.
 
-**Rationale**: The target is live and moves independently of the order. Checking only at submit would let an increase land on a subscription that was cancelled, transferred, or already being changed while the order sat in approval.
+Eligibility **MUST NOT** be enforced by a caller-side re-check before apply. The expected revision identifier **MUST** be carried on the change intent as a **precondition**, and Subscriptions **MUST** validate it — together with target non-terminality and the add-on bounds of the resulting composition — **inside the transaction that commits the change** (`CHG-S2`, §9.2). A precondition mismatch **MUST** reject the intent with a machine-readable reason and **MUST** leave the target unmodified; Orders then fails the change order or re-derives it against the current revision.
+
+**Rationale**: A caller-side check "immediately before apply" is a time-of-check-to-time-of-use gap, not a guard. Between that read and the commit the target can be cancelled, transferred, or independently recomposed — and the increase would then duplicate a component, exceed an add-on maximum, or land on a terminal subscription. Only a precondition evaluated by the owner of the data, in the same transaction as the write, actually closes it.
 
 **Actors**: `cpt-cf-bss-orders-changes-actor-chg-subscriptions`, `cpt-cf-bss-orders-changes-actor-chg-orders-workflow`
 
@@ -327,7 +329,11 @@ Where acceptance is required — by the governing contract or by platform defaul
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-changes-fr-chg-atomic-apply`
 
-Orders Workflow **MUST** apply the whole change order to the target subscription as **one transactional intent**, carrying every line of the order. The application **MUST** be all-or-nothing at the subscription: either every line's increase is in effect, or none is and the target is unchanged. A failure **MUST** leave no partial modification and **MUST** require no compensating action against the target. The intent **MUST** be idempotent under retry, and its identity **MUST** include the order and order version so a retry after an amendment cannot be absorbed as a duplicate of the superseded submit. **Acceptance of the change intent by Subscriptions is the cancellation boundary**, playing the role the subscription-spawn signal plays for an acquisition: before acceptance the change order **MAY** be cancelled directly and the target is untouched; after acceptance a direct cancel **MUST** be rejected and the order **MUST** be driven to its terminal outcome by the confirmation or failure. Because application is transactional, there is no post-acceptance state in which the target is partially modified and therefore no compensated-cancel path to specify.
+Orders Workflow **MUST** apply the whole change order to the target subscription as **one transactional intent**, carrying every line of the order. The application **MUST** be all-or-nothing at the subscription: either every line's increase is in effect, or none is and the target is unchanged. A failure **MUST** leave no partial modification and **MUST** require no compensating action against the target. The intent **MUST** be idempotent under retry, and its identity **MUST** include the order and order version.
+
+**Acceptance of the change intent by Subscriptions is the amendment and cancellation boundary**, playing the role the subscription-spawn signal plays for an acquisition. Before acceptance the change order **MAY** be amended or cancelled directly, and the target is untouched. From acceptance onward the system **MUST** reject both a direct cancel and an amendment, and the intent **MUST** be driven to a confirmation or a failure. A new version of the same change order **MUST NOT** be submitted while a prior version's intent is outstanding: differing identity prevents a duplicate from being absorbed, but it would not prevent **both** deltas from applying, and an increase applied twice is not recoverable within this phase's scope. A buyer who wants a different increase after acceptance places a **new** change order once the outstanding one has reached its outcome, and that order runs the gate and approval afresh.
+
+Because application is transactional, there is no post-acceptance state in which the target is partially modified, and therefore no compensated-cancel path to specify.
 
 **Rationale**: This is the requirement the single-target constraint (§6.1) exists to make achievable. The acquisition path can compensate a partial failure by voiding drafts, because nothing is live until activation. Here the target is live from the start, so the only available compensation would be a decrease — which this phase does not specify and which would drag in credit and proration semantics that have no authored owner. Requiring transactional application removes the need for a saga instead of building one on top of an unwritten reversal path.
 
@@ -337,9 +343,11 @@ Orders Workflow **MUST** apply the whole change order to the target subscription
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-changes-fr-chg-failure`
 
-A change order whose application fails **MUST** be acknowledged to Lifecycle as a fulfillment failure, carrying a machine-readable reason, and **MUST** produce a tracked record for the fulfillment operator — the same 100% visibility requirement as the acquisition path. Because nothing was applied, the operator's remediation is retry or cancel; there **MUST NOT** be a compensation step against the target subscription. An outcome that cannot be determined **MUST** be reconciled by status read, never assumed successful.
+A failed application **MUST NOT** immediately terminalize the change order. Because the transaction left the target unmodified, the order is **recoverable**: the system **MUST** hold it, record a machine-readable failure reason, and produce a tracked record for the fulfillment operator — the same 100% visibility requirement as the acquisition path. From that held state exactly two operator resolutions are available: **retry**, which re-derives the intent against the target's current revision (§6.1) and resubmits it, or **cancel**, which is permitted precisely because nothing was applied. There **MUST NOT** be a compensation step against the target subscription.
 
-**Rationale**: Transactional application makes the failure path short, and the requirement records why: there is no half-applied state to unwind, only an unapplied order to retry or abandon.
+The order reaches a terminal state only on one of: a confirmed application (`completed`), an operator cancel from the held state (`cancelled`), or exhaustion of the remediation policy (`fulfillment_failed`). An outcome that cannot be determined **MUST** be reconciled by status read against the target, never assumed successful and never assumed failed.
+
+**Rationale**: The cancellation boundary in §Single Transactional Application closes direct cancel at intent acceptance, which would otherwise read as "a failed order is immediately terminal and there is nothing to retry". Naming the held state resolves that: acceptance stops the buyer from cancelling underneath an in-flight commit, and a *failed* commit reopens the order to the operator, because a transaction that changed nothing leaves nothing to unwind.
 
 **Actors**: `cpt-cf-bss-orders-changes-actor-chg-orders-workflow`
 
@@ -466,7 +474,7 @@ The system **MUST** record 100% of change orders and their outcomes in the audit
 
 **Direction**: Required by Orders Workflow (intent to Subscriptions).
 
-**Description**: Orders Workflow **MUST** submit the change order as a **single** intent carrying the target subscription, every line's change kind, added quantity, added components, delta price pin, and requested effective date, plus the order reference (`orderId`, `orderVersion`) and the process correlation identifier. Subscriptions **MUST** apply it transactionally and **MUST** confirm or fail as a whole, echoing the order reference and correlation identifier. Payload shape is defined in Design and the Subscriptions PRD.
+**Description**: Orders Workflow **MUST** submit the change order as a **single** intent carrying the target subscription and its **expected revision identifier**, every line's change kind, added quantity, added components, delta price pin, and requested effective date, plus the order reference (`orderId`, `orderVersion`) and the process correlation identifier. Subscriptions **MUST** validate the expected revision as a precondition and apply the change transactionally, and **MUST** confirm or fail as a whole, echoing the order reference and correlation identifier. Payload shape is defined in Design and the Subscriptions PRD.
 
 **Compatibility**: Governed by the Subscriptions PRD breaking change policy.
 
@@ -481,9 +489,9 @@ The system **MUST** record 100% of change orders and their outcomes in the audit
 | Ask | Obligation |
 |-----|------------|
 | `CHG-S1` | Accept an **order reference** (`orderId`, `orderVersion`, `orderLineId`) on quantity-change and composition-change operations. The existing register covers `create` only; without this, a subscription increased by an order cannot be traced back to it. |
-| `CHG-S2` | Accept a **transactional multi-item change** against one subscription — several quantity increases and component additions applied as one commit, confirmed or failed as a whole. |
+| `CHG-S2` | Accept a **transactional multi-item change** against one subscription — several quantity increases and component additions applied as one commit, confirmed or failed as a whole — guarded by an **expected-revision precondition** supplied by the caller. Target non-terminality, the precondition, and the add-on bounds of the resulting composition **MUST** be evaluated inside that transaction, not by the caller beforehand (§6.1). A mismatch rejects the intent with a machine-readable reason and leaves the target unmodified. |
 | `CHG-S3` | Evaluate the **overlap rule with an exemption for the subscription being modified**, so a component addition is not rejected as a duplicate of its own target. |
-| `CHG-S4` | Expose a **composition read** sufficient for the delta gate: what the target currently carries, so add-on min/max/step bounds can be evaluated against the resulting composition rather than the line alone. |
+| `CHG-S4` | Expose a **composition read** sufficient for the delta gate: what the target currently carries, plus the **revision identifier** the precondition in `CHG-S2` is expressed against, so add-on min/max/step bounds can be evaluated against the resulting composition rather than the line alone. |
 | `CHG-S5` | Accept and honour a **requested effective date** on the change, and own its proration and billing consequences. |
 
 **Compatibility**: To be reconciled with the Subscriptions gear register at co-review.
@@ -501,14 +509,16 @@ The system **MUST** record 100% of change orders and their outcomes in the audit
 **Main Flow**:
 1. The partner opens a change order against the target subscription and adds a line of kind `increase_quantity`.
 2. Preview returns the delta gate result and the delta total including delta TCV.
-3. On submit, the gate passes; the delta price pin and delta total are captured; the order moves to `submitted`.
+3. On submit, the gate passes; the delta price pin, the delta total, and the target's expected revision identifier are captured; the order moves to `submitted`.
 4. The approval verdict is obtained against the delta TCV; approval is not required, so the order moves to `approved`.
-5. Workflow applies the increase as one transactional intent; Subscriptions confirms.
-6. The order completes, carrying the target reference and the applied delta.
+5. Because the order was placed by a partner rather than the customer, and the governing terms require acceptance, the customer-acceptance instant **MUST** be recorded before application; the order waits until it is.
+6. Workflow applies the increase as one transactional intent; Subscriptions validates the expected revision and confirms.
+7. The order completes, carrying the target reference and the applied delta.
 
 **Alternative Flows**:
+- Acceptance is not required by the governing terms: step 5 is skipped and application follows approval directly.
 - Gate fails on the purchase-quantity floor: submission is rejected with a machine-readable reason; no state is created.
-- Target became terminal during approval: the pre-apply eligibility check fails; the order fails with a machine-readable reason and the target is untouched.
+- The target was recomposed or became terminal during approval: Subscriptions rejects the intent on the revision precondition; the target is untouched and the order is held for the operator to retry against the current revision or cancel.
 
 ### UC-002 - Adding a Component to a Running Subscription
 
@@ -537,16 +547,17 @@ The system **MUST** record 100% of change orders and their outcomes in the audit
 **Preconditions**: An approved change order is ready for application.
 
 **Main Flow**:
-1. Workflow submits the change intent; Subscriptions rejects it or the outcome is a confirmed failure.
-2. The target subscription is unchanged — no line was applied.
-3. Workflow acknowledges a fulfillment failure to Lifecycle with the reason and creates a tracked operator record.
-4. The operator retries or cancels the change order; no compensation runs against the target.
+1. Workflow submits the change intent; Subscriptions rejects it — on the revision precondition or otherwise — or the outcome is a confirmed failure.
+2. The target subscription is unchanged: the transaction committed nothing.
+3. Workflow records the machine-readable reason, **holds** the change order rather than terminalizing it, and creates a tracked operator record.
+4. The operator either retries — the intent is re-derived against the target's current revision and resubmitted — or cancels the order, which is permitted because nothing was applied. No compensation runs against the target.
+5. The order becomes terminal only on a confirmed application, an operator cancel, or exhaustion of the remediation policy.
 
 ## 11. User Interaction and Design
 
 | **Interface Name** | **Role** | **Steps** | **Mockup Screen** |
 |--------------------|----------|-----------|-------------------|
-| Change order composer | As a partner admin, I want to add capacity or a component to a customer's subscription so that I can serve a growth request without disturbing running service | 1. Select the target subscription<br>2. Add capacity or choose a component with its add-ons<br>3. Review the priced delta and submit | — |
+| Change order composer | As a partner admin, I want to add capacity or a component to a customer's subscription so that I can serve a growth request without disturbing running service | 1. Select the target subscription<br>2. Add capacity or choose a component with its add-ons<br>3. Review the priced delta and submit<br>4. Where the governing terms require it, obtain and record the customer's acceptance before the increase is applied | — |
 | Buy-more (self-service) | As a direct customer, I want to increase my subscription so that I get more capacity immediately | 1. Choose what to add<br>2. See the incremental price<br>3. Confirm | — |
 | Change orders on a subscription | As a seller operator, I want to see change orders against a subscription so that I can explain how it grew | 1. Open the subscription<br>2. Review change orders and their applied deltas | — |
 
@@ -605,11 +616,13 @@ The system **MUST** record 100% of change orders and their outcomes in the audit
 - **Then** the target itself **MUST NOT** be counted as a collision
 - **And** the rule **MUST** still apply against any other subscription
 
-**9. Target ineligible at apply time**
-- **Given** an approved change order whose target became terminal after approval
-- **When** application is attempted
-- **Then** the pre-apply eligibility check **MUST** fail the order
+**9. Target changed between submit and apply**
+- **Given** an approved change order carrying the target's expected revision identifier
+- **And** the target has since been recomposed, transferred, or become terminal
+- **When** the change intent is committed
+- **Then** Subscriptions **MUST** reject it on the precondition, inside the transaction
 - **And** the target **MUST NOT** be modified
+- **And** a caller-side re-check before apply **MUST NOT** be relied on in its place
 
 ### Application
 
@@ -625,10 +638,16 @@ The system **MUST** record 100% of change orders and their outcomes in the audit
 - **Then** the system **MUST** accept the cancellation and the target **MUST** be untouched
 - **And** once the intent has been accepted, a direct cancel **MUST** be rejected and the order **MUST** be driven to its terminal outcome by the confirmation or failure
 
-**11. Retry after amendment is not absorbed as a duplicate**
-- **Given** a change order at version `N` whose intent was accepted
-- **When** an amendment produces version `N+1` and the intent is resubmitted
-- **Then** the intent identity **MUST** include the order version and **MUST** differ from that of version `N`
+**11. Amendment after intent acceptance is refused**
+- **Given** a change order at version `N` whose intent has been accepted by Subscriptions
+- **When** an amendment to that order is attempted
+- **Then** the system **MUST** reject it
+- **And** a second intent for the same order **MUST NOT** be submitted while the version-`N` intent is outstanding
+- **And** a further increase is placed as a **new** change order after the outstanding one reaches its outcome, running the gate and approval afresh
+
+**11a. Retry of an unaccepted intent is idempotent**
+- **Given** a change intent that was submitted but not accepted, retried with the same identity
+- **Then** the system **MUST** produce exactly one durable increase
 
 **12. Applied delta is carried on completion**
 - **Given** a change order that applied successfully
