@@ -13,7 +13,7 @@ refs:
 ---
 
 Created:  2026-08-24 by Virtuozzo International GmbH
-Updated:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-09-29 by Virtuozzo International GmbH
 
 # PRD — Subscriptions — End-to-End Lifecycle (Multi-Tenant Revenue Object)
 
@@ -66,6 +66,7 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
   - [Entitlements and trials](#entitlements-and-trials)
   - [Scheduled intents, quantity, pause, activation instants](#scheduled-intents-quantity-pause-activation-instants)
   - [Ordering pin, recurring split, void, pause interplay](#ordering-pin-recurring-split-void-pause-interplay)
+  - [Orders, contracts, and usage attribution](#orders-contracts-and-usage-attribution)
 - [13. Dependencies](#13-dependencies)
 - [14. Assumptions](#14-assumptions)
 - [15. Open Questions](#15-open-questions)
@@ -82,6 +83,8 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
 **Subscriptions** is the BSS gear that owns the **subscription** as the **primary commercial aggregate** for recurring revenue: a versioned, auditable **lifecycle state machine** with **effective-dated composition** (`PlanLink`, `AddOn`) that **aligns** Rating (usage + rated charges) and Billing (recurring line items, tax, GL, ASC inputs) under **multi-tenant** ownership (`resourceTenantId`, `payerTenantId`, `sellerTenantId`).
 
 This gear owns the lifecycle **engine** — state machine, versioning and snapshots, renewal and failed-renewal/grace, events and ordering, multi-tenant delegation — **not** the catalog primitives it composes (`Plan`/`Price`/`PriceWindow` are the Pricing gear's), **not** the proration/evaluation math (the Rating gear's), and **not** posting or invoice immutability enforcement (Billing's). Since the 2026-07-15 consolidation it is also the normative home for the **entitlement lifecycle** — issue/revoke, the point-of-use check contract, quotas and limits (§6.9) — and for **trial runtime & conversion** (§6.10), absorbed from the predecessor Subscriptions & Entitlements PRD (§2.2).
+
+Commercially initiated acquisitions and increases reach this gear from the **Orders** gears (Orders Lifecycle, Orders Workflow, Change Orders): a fulfilled order line spawns exactly one subscription through a two-phase create-then-activate pair, and a change order applies one transactional change to an existing subscription (§6.1, §6.3). System-driven transitions — renewal, automatic trial conversion, dunning-driven suspension — stay direct and produce no order. A subscription is governed by a Contract where one is bound and by the published **platform defaults** otherwise; the uncontracted subscription is a first-class state, not a stopgap (§6.5).
 
 ### 1.2 Background / Problem Statement
 
@@ -116,23 +119,29 @@ The predecessor additionally carried the **entitlement framework** (feature flag
 | **AddOn** | Optional add-on product attached to a subscription with an effective window (`start`/`end` or equivalent); composes with **`PlanLink`** for commercial/rating context (manifest §4.3). |
 | **Billing anchor** | UTC instant or calendar rule fixing cycle boundaries (`billingAnchor` on Subscription per manifest data model); drives recurring `BillableItem` period alignment. |
 | **Cancellation policy** | Rules governing how a cancel takes effect — immediate, end-of-term, or at a date — and refund/credit eligibility. Modeled as **scheduled lifecycle intents** (§6.1, SUB-D-01); credits materialize only as Billing artifacts. |
+| **Change intent** | One transactional request from Orders Workflow applying a change order to an existing subscription: several quantity increases and component additions, confirmed or failed as a whole, guarded by an **expected revision** (§6.3, `fr-composite-change`). |
 | **Commercial aggregate** | Domain aggregate rooted at `subscriptionId`; ordering key for CloudEvents per manifest §4.2/§4.3. |
 | **Committed usage** | Contractual minimum usage/spend over a term, tracked for true-up. Commitment pools are **Contracts SoR**, evaluated with true-up by the rating gear (T-D-14); this gear keeps subscription-side hooks only (§2.2). |
 | **Entitlement** | Authorization defining what resources, features, or usage limits a customer can access based on the active subscription. Authored as the plan's grant set (pricing gear, incl. the per-phase map), **issued/revoked and accounted here** (§6.9); enforced at point of use by OSS against this gear's check contract. |
 | **Evaluated fields** | Subscription-stored attributes (e.g. **`graceEndsAt`**, pause flags, ladder variant) computed at **renewal evaluation** time from **Contract** / **`Renewal`** terms for audit, idempotent renewal jobs, and replay. |
-| **Evergreen subscription** | Indefinite-term subscription continuing until explicitly cancelled (no fixed end date); terms and notice behavior live on Contract §4.6. |
+| **Evergreen subscription** | Indefinite-term subscription continuing until explicitly cancelled (no fixed end date); terms and notice behavior live on the bound Contract, or on the platform defaults where none is bound (§6.5). |
+| **Expected revision** | The subscription `version` a caller asserts as a precondition of a change; a mismatch rejects the change with the subscription unmodified (§6.3). |
 | **Feature flag** | Boolean entitlement controlling access to a product feature (enabled/disabled per subscription). |
 | **Fixed-term subscription** | Subscription with a defined start/end; may auto-renew or expire at term end (Contract terms; self-service term metadata on the Plan is deferred — pricing §17.8). |
 | **Grace period** | Window after a **failed renewal** attempt (pre-check or aligned billing failure) during which the subscription may stay **`active`** while retries/dunning run; duration, billing posture, and exit triggers in §6.5. |
 | **Hard limit** | Usage threshold blocking further usage until a quota increase or a new billing cycle; enforced by OSS on this gear's quota state (§6.9). |
 | **idempotencyKey** | Client-supplied identifier on mutating requests; Subscriptions MUST treat duplicate `(subscriptionId, idempotencyKey)` as the same logical operation so exactly **one** durable effect results (manifest §4.3). |
+| **Order reference** | `orderId`, `orderVersion` and `orderLineId` of the order line that produced or changed a subscription, plus the order's optional external reference (e.g. a purchase-order number). Persisted on the subscription and on the billable facts it emits (§6.1, §6.8). |
+| **Order-originated subscription** | A subscription created from a fulfilled `new_sale` order line through the two-phase create-then-activate pair (§6.1, `fr-order-originated-create`). One line spawns exactly one subscription carrying the line's quantity; a bundle plan is one line and one subscription. |
+| **Overlap occupancy** | For a `(payerTenantId, overlapScopeKey)`: the number of `active` subscriptions holding the key, the effective `maxConcurrentActive`, and the policy it was resolved from (§6.3). |
 | **PlanLink** | Effective-dated link between a subscription and a **catalog plan** (`planId` with `effectiveFrom`/`effectiveTo`); defines which plan applies for rating/billing over each interval (manifest §4.3). The referenced plan/price primitives are authored in the **Pricing gear** ([pricing PRD](../../pricing/docs/PRD.md)). |
-| **Plan phase** | Time-bounded segment of a subscription plan (e.g. **trial**, intro, evergreen) with its own price schedule. **Phase structure is Pricing SoR** — the ordered phase set, `convertsToPhaseId` chain, durations and per-phase prices are authored in the catalog and published immutably per plan revision ([pricing PRD](../../pricing/docs/PRD.md) `fr-plan-phases`; 2026-07-31 PR-review fix — this row previously claimed structure for Subscriptions, contradicting the pricing FR it links); **Subscriptions owns the runtime composition and evaluated state**: the effective `PlanLink`s, phase entry/conversion execution from the published durations, and the **active phase at `t`** evaluation resolves — see the **Rating gear** ([rating PRD](../../rating/docs/PRD.md) §17.1 step 1). Trials are modeled as a phase, **not** a `Subscription.status` (§6.1). |
+| **Plan phase** | Time-bounded segment of a subscription plan (kind **`trial`**, `interim`, or `evergreen` — `interim` was spelled `intro` until pricing D-358, 2026-09-09) with its own price schedule. **Phase structure is Pricing SoR** — the ordered phase set, `convertsToPhaseId` chain, durations and per-phase prices are authored in the catalog and published immutably per plan revision ([pricing PRD](../../pricing/docs/PRD.md) `fr-plan-phases`; 2026-07-31 PR-review fix — this row previously claimed structure for Subscriptions, contradicting the pricing FR it links); **Subscriptions owns the runtime composition and evaluated state**: the effective `PlanLink`s, phase entry/conversion execution from the published durations, and the **active phase at `t`** evaluation resolves — see the **Rating gear** ([rating PRD](../../rating/docs/PRD.md) §17.1 step 1). Trials are modeled as a phase, **not** a `Subscription.status` (§6.1). |
 | **PlanTier** | Commercial **tier** implied by the subscribed SKU/plan (e.g. edition/steps); MUST be derivable for any charge instant and remain consistent with **Policy**-gated composition changes (manifest §4.3). The `PlanTier` **taxonomy** is owned by the Catalog registry — the **products** gear (`gears/bss/products/docs/PRD.md`, vendored 2026-07-16). |
+| **Platform defaults** | The complete published term set that governs a subscription with no bound Contract: auto-renewal, term, billing anchor instant (the activation instant), notice ladder (30/14/7/1 days), grace (7 days), nonpayment dwell (90 days), acceptance requirement, concurrent-active cardinality. Tenant-configurable within platform bounds; superseded for a subscription only by an explicit Contract binding (§6.5, `fr-platform-defaults`). |
 | **PriceWindow** | Catalog price interval (`planId`/`priceId`, `effectiveFrom`, `effectiveTo`) per BSS manifest §4.1. A `PriceWindow` only schedules **when** a price row is effective — pricing defines **no** promotional/trial window kind (pricing ADR-0003, design/07: states are `scheduled\|active\|expired\|cancelled`), so trial offers are **not** expressible as windows; trials are plan **phases** (pricing D-15). Completes the removal SEAMS SUB-P3 records (2026-07-29 cross-gear review, pricing D-66). Linkage/authoring and window scheduling/activation in the **Pricing gear** ([pricing PRD](../../pricing/docs/PRD.md)). |
 | **prorationBasis** | Day-count convention (`calendar_days_actual`, `calendar_days_30`, `by_second`, `whole_unit`, or `none`) applied to **all** mid-period proration of the recurring component; configured on the plan/price policy and frozen in `pricingSnapshotRef`. The **canonical enum is owned by the pricing gear** ([pricing `design/06`](../../pricing/docs/design/06-consumer-contracts.md)) and adopted **verbatim** here and by Rating — CI gate `pricing.contracts.enum_drift` (2026-07-28 cross-gear review fix: the `none` value was missing and ownership was misattributed to Rating, which had already conformed). Subscriptions only sets the change boundary/mode. |
-| **billingAnchorPolicy** | Pricing-published per-row policy fixing how the recurring billing anchor is derived; the **canonical enum (K2, incl. the D-20 no-drift month-end clamp) is owned by the pricing gear and adopted verbatim** here — the same discipline as `prorationBasis`, CI gate `pricing.contracts.enum_drift` (SUB-D-27, 2026-08-01; SB1 resolved this gear's way — rating T-D-33). **This gear's emitter executes the math**: `[periodStart, periodEnd)` derives from the frozen policy with the clamp (a Jan-31 monthly anchor bills Feb-28/29 and returns to the 31st — never permanent drift); an anchor-altering plan change takes effect at the **next** period boundary; the K5 joint anchor fixture (this gear's period identity ≡ rating's calendar geometry) is a design-freeze gate. `billingAnchor` — the anchor *instant* — still derives from Contract terms at activation (design slice 01 §3.7); the policy governs how boundaries fall from it. |
-| **Regional template** | Seller-defined **contract template** with jurisdiction-specific commercial defaults (e.g. grace duration within **Legal** bounds); authoritative in **Contracts** (`PRD-contracts-agreements-202601120119`, upstream). |
+| **billingAnchorPolicy** | Pricing-published per-row policy fixing how the recurring billing anchor is derived; the **canonical enum (K2, incl. the D-20 no-drift month-end clamp) is owned by the pricing gear and adopted verbatim** here — the same discipline as `prorationBasis`, CI gate `pricing.contracts.enum_drift` (SUB-D-27, 2026-08-01; SB1 resolved this gear's way — rating T-D-33). **This gear's emitter executes the math**: `[periodStart, periodEnd)` derives from the frozen policy with the clamp (a Jan-31 monthly anchor bills Feb-28/29 and returns to the 31st — never permanent drift); an anchor-altering plan change takes effect at the **next** period boundary; the K5 joint anchor fixture (this gear's period identity ≡ rating's calendar geometry) is a design-freeze gate. `billingAnchor` — the anchor *instant* — still derives from Contract terms at activation (design slice 01 §3.7), and for an uncontracted subscription from the platform defaults: the activation instant (`serviceActivatedAt`); the policy governs how boundaries fall from it. |
+| **Regional template** | Jurisdiction-scoped set of default contract terms (notice minima, grace, cancellation rights) with **statutory minima** a contract term may not fall below; authored by the **contracts** gear (`gears/bss/contracts/docs/PRD.md` `fr-grace-regional`). |
 | **Renewal notice** | Notification sent before auto-renewal at configurable intervals (default 30/14/7/1 days) for customer awareness; triggered here, delivered via Notifications (§6.5). |
 | **Resource-affecting transition** | Any transition that changes entitlements, provisioned resources, or quota-bearing bindings; MUST pass the Policy Engine gate before commit (manifest §4.3, §6). |
 | **Resource quota** | Entitlement limiting resource provisioning (e.g. max 10 VMs, max 5 TB total storage). |
@@ -140,6 +149,7 @@ The predecessor additionally carried the **entitlement framework** (feature flag
 | **Subscription pause** | Temporary pause preserving subscription state with no charges during the pause window — distinct from suspension (service-affecting). Modeled as the **`collectionPaused`** posture on `active` (§6.4, SUB-D-03). |
 | **Subscription revision** | Monotonic `version` (and/or revision record) capturing **effective-dated** composition and commercial snapshot pointers after a committed transition. |
 | **Trial period** | Time-limited free or reduced-cost period modeled as the leading plan phase (§6.1); runtime, conversion, expiry, and extension in §6.10. |
+| **Usage attribution binding** | Effective-dated link from a provisioned resource or subject to the subscription component that provisioned it, born at provisioning confirmation and closed at deprovision; the source Rating uses to attribute usage records, which carry no commercial identity (§6.2, `fr-usage-attribution`). |
 | **Usage quota** | Numeric entitlement defining maximum allowed usage (e.g. 100 GB storage, 1000 API calls/month); tracked against usage aggregates (§6.9). |
 
 ## 2. Architecture Alignment
@@ -158,11 +168,11 @@ The predecessor additionally carried the **entitlement framework** (feature flag
 | **Concern** | **Authoritative owner** | **This PRD's relationship** |
 |-------------|-------------------------|------------------------------|
 | Product, SKU, Category, Attribute, `PlanTier` **taxonomy**, `CatalogVersion`, publish | Catalog registry — the **products** gear (`gears/bss/products/docs/PRD.md`, vendored 2026-07-16) | Reads **published** SKUs / `CatalogVersion`; `PlanLink` / overlap key bind to published catalog keys |
-| `Plan`, `Price`, `PriceWindow` linkage, bundle/add-on rules, billing descriptors | **Pricing gear** — [pricing PRD](../../pricing/docs/PRD.md) (§4.1) | `PlanLink` / `AddOn` reference these primitives; trial offers are catalog plans/price windows |
+| `Plan`, `Price`, `PriceWindow` linkage, bundle/add-on rules, billing descriptors | **Pricing gear** — [pricing PRD](../../pricing/docs/PRD.md) (§4.1) | `PlanLink` / `AddOn` reference these primitives; trial offers are catalog trial plans or a leading trial **phase** — pricing defines no promotional/trial window kind (§1.4 PriceWindow) |
 | Tariff **evaluation semantics**: graduated/volume math, override hierarchy, coupons, FX, **proration math** (`prorationBasis`) | **Rating gear**, evaluation core — [rating PRD](../../rating/docs/PRD.md) (§4.2) | Subscriptions owns the plan-change **WHEN** + `changeMode`; the evaluation core consumes `(changeEffectiveAt, changeMode)` and owns the math |
 | Usage → `RatedCharge` / `BillableItem` orchestration, dedup, partition ordering | **Rating gear**, operational pipeline — [rating PRD](../../rating/docs/PRD.md) (§4.2) | Rating reads subscription composition + `PlanTier` @ `t` from this PRD's read models |
 
-**Manifest silence and deferrals** (MUST be resolved in manifest, Design, or explicit product rules — this PRD MUST NOT invent conflicting enums or global cardinality): **trials** are handled per §6.1 (attribute/composition on manifest statuses, not a `trial` status value), including the **commercial pattern** there. **Overlapping active subscriptions** use the **default cardinality** in §6.3 (the manifest does not fix global cardinality). **ASC 606** operational detail is outside the manifest; this PRD only states subscription-level traceability and snapshot hooks for Finance/Billing. Design documentation MUST close trial attribute/event naming, overlap **dimension** binding, and **Payments/Billing integration details** (PSP webhooks, dunning handoff payloads) consistent with the **grace ladder** in §6.5.
+**Manifest silence and deferrals** (MUST be resolved in manifest, Design, or explicit product rules — this PRD MUST NOT invent conflicting enums or global cardinality): **trials** are handled per §6.1 (attribute/composition on manifest statuses, not a `trial` status value), including the **commercial pattern** there. **Overlapping active subscriptions** use the **default cardinality** in §6.3 (the manifest does not fix global cardinality). **ASC 606** operational detail is outside the manifest; this PRD only states subscription-level traceability and snapshot hooks for Finance/Billing. Design documentation MUST close trial attribute/event naming, overlap **dimension** binding, and **Payments/Billing integration details** (PSP webhooks, dunning handoff payloads) consistent with the **grace ladder** in §6.5. **New acquisitions**: manifest §4.6.1 routes them through a fulfilled Order ("only a fulfilled Order spawns the Subscription"); this PRD adopts the order path as the caller of record for commercially initiated creates and keeps the direct `create` for system, migration and operator paths and for deployments running before the order path ships (§6.1 `fr-order-originated-create`; manifest alignment tracked in §15).
 
 ### 2.1 Terminology and Naming
 
@@ -172,11 +182,13 @@ The predecessor additionally carried the **entitlement framework** (feature flag
 | **Pricing (Product Catalog)** | The sibling gear vendoring upstream `PRD-plan-price-modeling-202605281200` — SoR for `Plan`/`Price`/`PriceWindow`/`PriceOverlay`/`CatalogVersion` that `PlanLink`/`AddOn` reference ([pricing PRD](../../pricing/docs/PRD.md)). |
 | **Rating** | The sibling gear vendoring upstream `PRD-tariffs-pricing-logic-202604011200` + `PRD-rating-engine-202604031200`, **consolidated into one gear** per rating [ADR-0002](../../rating/docs/ADR/0002-cpt-cf-bss-rating-adr-rating-gear-consolidation.md): the pure evaluation core (`rating-core`, successor of "PLAL"/"Tariffs") plus the operational pipeline. Upstream text referring to "Tariffs" and "Rating" as two PRDs reads onto this one gear. |
 | **Catalog registry** | The **products** gear — `gears/bss/products/docs/PRD.md` (Product/SKU/Category/Attribute/`PlanTier` taxonomy/`CatalogVersion`); vendored 2026-07-16 from upstream PR #4177 (provenance in the doc). |
-| **Contracts / Billing / Payments / Promotions** | Upstream domains without vendored gears in this repository; referenced by their upstream PRD names (§17). |
+| **Orders** | The **orders-lifecycle** (order document and state SoR), **orders-workflow** (approval and fulfillment orchestration — the caller of record for commercially initiated creates) and **orders-changes** (change orders for increases) gears — `gears/bss/orders-*/docs/PRD.md`. |
+| **Contracts** | The **contracts** gear — `gears/bss/contracts/docs/PRD.md` (first draft, 2026-08-17: §1–§6 written, no acceptance criteria yet). Authors renewal terms, the notice and grace ladders, regional templates, ramps and the booking/acceptance declaration this PRD consumes. |
+| **Billing / Payments / Promotions** | Billing posting is the **ledger** gear (`gears/bss/ledger/docs/PRD.md`); invoicing, dunning, Payments and Promotions have no gear in this repository and are referenced by their upstream PRD names (§17). |
 
 ### 2.2 Predecessor PRDs and Scope Migration
 
-`PRD-subscriptions-entitlements-202601120119` describes the **Subscriptions + Entitlements** module in breadth (PRD-0001 mapping, SLAs, recurring charges, trials, and entitlement enforcement at point of use). **This PRD does not archive or fully replace that document**; it **specializes** the **BSS-manifest-aligned commercial lifecycle** for the subscription aggregate: §4.3 **status** model and operations (including **resume**), **`TransitionRequest`** / **idempotency** / **ordering**, Policy Engine and OSS interlocks, effective-dated **`PlanLink`** / **`AddOn`** and subscription **versioning**, recurring **`BillableItem`** rules aligned to §4.4, Contract-linked **renewal** and **failed-renewal** boundaries, and multi-tenant **ownership** / **delegation**. Work and acceptance criteria for those topics SHOULD trace **here** and to **Design**, rather than duplicating parallel normative lifecycle text in the predecessor.
+`PRD-subscriptions-entitlements-202601120119` describes the **Subscriptions + Entitlements** module in breadth (PRD-0001 mapping, SLAs, recurring charges, trials, and entitlement enforcement at point of use). This PRD began upstream as its manifest-first **specialization** for the subscription aggregate — §4.3 **status** model and operations (including **resume**), **`TransitionRequest`** / **idempotency** / **ordering**, Policy Engine and OSS interlocks, effective-dated **`PlanLink`** / **`AddOn`** and subscription **versioning**, recurring **`BillableItem`** rules aligned to §4.4, Contract-linked **renewal** and **failed-renewal** boundaries, and multi-tenant **ownership** / **delegation** — and has since absorbed the predecessor entirely (below). Work and acceptance criteria for all of these topics trace **here** and to **Design**.
 
 **Consolidation (2026-07-15, this repository).** The predecessor is **absorbed into this PRD**; in this repository it is superseded in full. Section map:
 
@@ -244,13 +256,13 @@ The predecessor additionally carried the **entitlement framework** (feature flag
 
 **ID**: `cpt-cf-bss-subscriptions-actor-pricing`
 
-**Role**: SoR for `Plan`/`Price`/`PriceWindow` linkage, bundle/add-on rules, billing descriptors, and publish/sellability gates that `PlanLink`/`AddOn` resolve against; trial offers are catalog plans/price windows ([pricing PRD](../../pricing/docs/PRD.md)).
+**Role**: SoR for `Plan`/`Price`/`PriceWindow` linkage, bundle/add-on rules, billing descriptors, and publish/sellability gates that `PlanLink`/`AddOn` resolve against; trial offers are catalog trial plans or a leading trial phase ([pricing PRD](../../pricing/docs/PRD.md)).
 
 #### Catalog Registry (Product & SKU)
 
 **ID**: `cpt-cf-bss-subscriptions-actor-catalog-registry`
 
-**Role**: SoR for published `skuId`, `PlanTier` taxonomy, `CatalogVersion`; the overlap key (`catalogSubscriptionProductKey`) binds to its published keys (the **products** gear, `gears/bss/products/docs/PRD.md`).
+**Role**: SoR for published `skuId`, `PlanTier` taxonomy, `CatalogVersion`; the overlap key (`catalogSubscriptionProductKey`) binds to its published keys (the **products** gear, `gears/bss/products/docs/PRD.md`). The registry does not yet expose that key (SEAMS SUB-G1; also asked by Orders Lifecycle).
 
 #### Rating (Evaluation Core + Pipeline)
 
@@ -268,7 +280,13 @@ The predecessor additionally carried the **entitlement framework** (feature flag
 
 **ID**: `cpt-cf-bss-subscriptions-actor-contracts`
 
-**Role**: SoR for signed terms, `Renewal` (`autoRenew`, term windows, notice), grace ladder and regional templates, `PriceOverride` windows; supplies defaults/snapshots via events and read models.
+**Role**: SoR for signed terms, `Renewal` (`autoRenew`, term windows, notice ladder), grace ladder and regional templates, ramps, `PriceOverride` windows, the booking instant and the acceptance-required declaration; supplies them via events and read models (the **contracts** gear, `gears/bss/contracts/docs/PRD.md`). Optional per subscription: where none is bound, the platform defaults govern (§6.5).
+
+#### Orders (Lifecycle + Workflow + Change Orders)
+
+**ID**: `cpt-cf-bss-subscriptions-actor-orders`
+
+**Role**: Orders Workflow submits the order path's intents — draft-create and activation per fulfilled `new_sale` line, draft-void and activated-cancel as compensation, one change intent per change order — each carrying the order identity envelope, and consumes the per-intent confirmation or failure. Orders Lifecycle reads overlap occupancy and composition for its submit and delta gates. Orders never mutates subscription state directly (orders-lifecycle §6.4 R3, R5).
 
 #### Policy Engine
 
@@ -327,12 +345,18 @@ The predecessor additionally carried the **entitlement framework** (feature flag
 **End-to-end lifecycle (value stream)**
 
 ```text
-ContractSigned ──▶ create(draft) ──▶ activate ──▶ [active ── suspended loop] ──▶ cancel ──▶ archived
-                         │                │                              │
-                         │                └──▶ PlanLink/AddOn updates ──┘
-                         │                └──▶ recurring period fact ──▶ Rating (price) ──▶ Billing ──▶ Invoice(posted)
-OSS Usage ──▶ Rating ──▶ BillableItem(usage) ─────────────────────────────────────────────▶ Billing
+[Contract, optional] ─ defaults / eligibility ─┐
+                                               ▼
+Order (fulfilled, Orders Workflow) ──▶ create(draft) ×N ──▶ activate ×N ──▶ [active ── suspended loop] ──▶ cancel ──▶ archived
+   │  wave 1: every line in draft        │  wave 2        │                              │
+   │  compensation: void (draft)         │                └──▶ PlanLink/AddOn updates ──┘
+   │  or cancel (order_compensation)     │                └──▶ recurring period fact ──▶ Rating (price) ──▶ Billing ──▶ Invoice(posted)
+   │                                     └──▶ one-time fact at activation ──▶ Billing
+Change order ──▶ one change intent (all-or-nothing) ──▶ quantity / component increase on the running subscription
+OSS Usage ──▶ Rating (attributes via this gear's usage attribution read) ──▶ BillableItem(usage) ──▶ Billing
 ```
+
+`ContractSigned` supplies defaults and eligibility only — it does not create a subscription (manifest §4.6). The direct `create` remains for system, migration and operator paths (§6.1).
 
 **Policy-gated transition (condensed)**
 
@@ -350,20 +374,22 @@ Client ─▶ API GW ─▶ Subscriptions: validate + TransitionRequest
 - **AMS/OSS**: tenant identity, `resourceTenantId` topology references (read-only for the BSS SoR split).
 - **Catalog registry**: published `skuId`, `PlanTier` taxonomy, `CatalogVersion` for eligibility.
 - **Pricing gear**: published `planId`, `PriceWindow` linkage / price snapshot refs that `PlanLink` / `AddOn` resolve against.
-- **Contracts**: signed terms, `Renewal`, `PriceOverride` windows (events + read models).
+- **Contracts**: signed terms, `Renewal`, notice and grace ladders, regional templates, ramps, `PriceOverride` windows, booking instant and acceptance declaration (events + read models); absent a bound contract, the platform defaults (§6.5).
+- **Orders Workflow**: draft-create, activation, draft-void and activated-cancel intents per order line; one change intent per change order; each with the order identity envelope (§6.1, §6.3, §9.2).
 - **Policy Engine**: allow/deny + `reasonCodes` for resource-affecting transitions.
 
 **Outbound (Subscriptions produces)**
 
 - **OSS Provisioning**: work orders confirmed by events (manifest flows).
 - **Billing**: `BillableItemCreated(kind=recurring)` — the money-free period fact with stable catalog refs + `pricingSnapshotRef`; the rating gear prices it before Billing posts (SUB-D-07, §6.8; per the §4.1–4.2 contract).
-- **Rating** (indirect): composition, effective `PlanLink`, `PlanTier`, and active **plan phase** at `t` via read models; plan-change `(changeEffectiveAt, changeMode)` consumed for proration math; usage already keyed by `subscriptionId`.
+- **Rating** (indirect): composition, effective `PlanLink`, `PlanTier`, and active **plan phase** at `t` via read models; plan-change `(changeEffectiveAt, changeMode)` consumed for proration math; the **usage attribution read** that maps a usage record's resource or subject to its subscription component at `t` — usage arrives from the Usage Collector with no commercial identity (§6.2 `fr-usage-attribution`).
+- **Orders**: per-intent confirmations and failures echoing the identity envelope; overlap occupancy and composition reads for the order gates (§9.1, §9.2).
 - **Analytics/DWH**: lifecycle facts.
 
 ### 4.1 Module-Specific Environment Constraints
 
 - All effective dating, anchors, and boundaries are **UTC**; events are **CloudEvents 1.0**, tenant-scoped, minimal PII.
-- Every mutating request is **idempotent** on `(subscriptionId, idempotencyKey)`; consumers preserve ordering within `(tenantId, aggregateId = subscriptionId)`.
+- Every mutating request is **idempotent** on `(subscriptionId, idempotencyKey)` — `create`, which has no `subscriptionId` yet, on `(orderingTenantId, operation = create, idempotencyKey)`; consumers preserve ordering within `(tenantId, aggregateId = subscriptionId)`.
 - **Resource-affecting** transitions never commit without a Policy Engine pre-check (fail-closed) and, where required, OSS provisioning confirmation.
 - BSS MUST NOT mutate OSS resource topology; Subscriptions **requests** changes via Policy-gated workflows only.
 
@@ -386,6 +412,12 @@ Client ─▶ API GW ─▶ Subscriptions: validate + TransitionRequest
 | Trial runtime & conversion (create, auto-convert, early `convertTrial`, expire, extension) | `p1` | §6.10; rides the pricing phase machinery (D-19/D-41) |
 | Scheduled lifecycle intents (cancel at term end / at date; resume-at) | `p1` | §6.1 pending intents + renewal-job interaction (SUB-D-01) |
 | Seat/quantity change transition (`updateQuantity`) | `p1` | §6.3 envelope + provenance for pricing D-18 seat counts (SUB-D-02) |
+| Order-originated acquisition: two-phase create/activate, order reference, start at the activate commit, compensation | `p1` | §6.1; Orders Workflow is the caller of record for commercially initiated creates (SEAMS SUB-O1/O2/O3/O10) |
+| Order change intent: transactional multi-item increase with an expected revision | `p1` | §6.3 (Change Orders CHG-S1…S5) |
+| Overlap occupancy read + atomic enforcement at entry into `active` | `p1` | §6.3 (SEAMS SUB-O5, amended) |
+| Caller intent protocol: resubmit/in-flight signal, withdrawal, status read, identity echo, correlation propagation | `p1` | §6.1 (SEAMS SUB-O11…O14, SUB-O16) |
+| Platform defaults for uncontracted subscriptions; explicit contract binding | `p1` | §6.5 |
+| Usage attribution binding + as-of read for Rating | `p1` | §6.2 |
 | API surface (control plane): create, read, update metadata, transitions, cancel | `p2` | Business verbs only in PRD; idempotency + optimistic concurrency (§9.1) |
 | Backdated & overlapping subscription rules | `p2` | §6.3; AC 6/8 |
 | Failed renewal / dunning handoff | `p2` | Subscriptions state + Billing/Payments boundaries (§6.5) |
@@ -407,6 +439,7 @@ Client ─▶ API GW ─▶ Subscriptions: validate + TransitionRequest
 - **Notification delivery channels and campaign content** (renewal notices, trial expiry, win-back messaging) — Notifications/Comms; this PRD fixes the triggers and intervals only (§6.5, §6.10).
 - **Enforcement execution at the point of use** — OSS enforces (allow/block/degrade) against this gear's check contract and quota state (§6.9); the enforcement action itself and graceful-degradation behavior mid-request are OSS/Design concerns (§15).
 - **UI implementation** of the consoles/portals in §11 — Presentation layer; this PRD fixes the operations they invoke.
+- **Order capture, approval and fulfillment orchestration** — the Orders gears; this PRD fixes only what Subscriptions accepts from them and returns (§6.1, §6.3, §9.2). Order-driven **decreases, removals and plan changes** are not specified by Change Orders yet; until they are, those changes use the direct operations.
 
 ## 6. Functional Requirements
 
@@ -473,7 +506,7 @@ Every **resource-affecting** transition MUST pass the Policy Engine pre-check be
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-fr-trials-not-a-status`
 
-A commercial **trial** is **not** a `Subscription.status` value. Manifest §4.3 lists **`draft` | `active` | `suspended` | `cancelled` | `archived`** only; this PRD MUST NOT add a **`trial`** state or edges such as **`trial` → `active`** / **`trial` → `cancelled`** unless the BSS manifest enum is extended first. Trial periods MUST be expressed with **attributes** and/or **effective-dated composition** (trial **plan/SKU** via `PlanLink`, contract or subscription flags, Catalog trial offers) while the subscription occupies a manifest status — commonly **`draft`** before first paid activation and/or **`active`** when service is delivered under trial commercial rules. Where a plan defines time-bounded phases, the trial is modeled as the leading **plan phase** (`trial` → intro/evergreen; §1.4 Plan phase); **phase structure is Subscriptions SoR**, and the Rating gear resolves the active phase at `t` for pricing. End-of-trial without conversion uses normal transitions and composition changes (**cancel**, **changePlan**, or attribute update) without a dedicated trial terminal **status**.
+A commercial **trial** is **not** a `Subscription.status` value. Manifest §4.3 lists **`draft` | `active` | `suspended` | `cancelled` | `archived`** only; this PRD MUST NOT add a **`trial`** state or edges such as **`trial` → `active`** / **`trial` → `cancelled`** unless the BSS manifest enum is extended first. Trial periods MUST be expressed with **attributes** and/or **effective-dated composition** (trial **plan/SKU** via `PlanLink`, contract or subscription flags, Catalog trial offers) while the subscription occupies a manifest status — commonly **`draft`** before first paid activation and/or **`active`** when service is delivered under trial commercial rules. Where a plan defines time-bounded phases, the trial is modeled as the leading **plan phase** (`trial` → `interim`/`evergreen`; §1.4 Plan phase); **phase structure is Pricing SoR** (authored and published per plan revision), **phase runtime is Subscriptions SoR** (entry, conversion, and the active phase at `t`), and the Rating gear resolves the active phase at `t` for pricing. End-of-trial without conversion uses normal transitions and composition changes (**cancel**, **changePlan**, or attribute update) without a dedicated trial terminal **status**.
 
 **Rationale**: Keeping trials out of the status enum preserves manifest conformance and keeps the state machine closed.
 
@@ -483,7 +516,7 @@ A commercial **trial** is **not** a `Subscription.status` value. Manifest §4.3 
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-fr-trial-commercial-pattern`
 
-**Catalog** is authoritative for the **trial sellable definition** (trial plan/SKU, a trial **phase** on the plan, or a time-bounded **`PlanLink`** to a trial offer — the third enumeration member, "promotional `PriceWindow`", is removed: pricing has no such window kind, SEAMS SUB-P3, 2026-07-29, pricing D-66). **Contract** carries **legal and commercial trial clauses** (notice, conversion, caps) where required. **Subscription** persists **evaluated** trial state as **attributes** plus effective **`PlanLink`** / snapshot pointers so Rating/Billing stay deterministic. **Attribute-only** trials without a Catalog-managed offer are **permitted** only when **Contract** still records the trial commercial terms (minimum viable for audit). Trial **runtime, conversion, expiry, and extension** are normative in §6.10 (absorbed from the predecessor — §2.2); **Design** defines concrete fields and optional trial-specific events while preserving the status enum.
+**Catalog** is authoritative for the **trial sellable definition** (trial plan/SKU, a trial **phase** on the plan, or a time-bounded **`PlanLink`** to a trial offer — the third enumeration member, "promotional `PriceWindow`", is removed: pricing has no such window kind, SEAMS SUB-P3, 2026-07-29, pricing D-66). **Contract** MAY carry **legal and commercial trial clauses** (notice, conversion, caps) where a contract is bound; no Contracts artifact authors such clauses today (the contracts gear's §6 has none), so trial terms default to the Catalog definition plus the platform defaults (§6.5). **Subscription** persists **evaluated** trial state as **attributes** plus effective **`PlanLink`** / snapshot pointers so Rating/Billing stay deterministic. **Attribute-only** trials without a Catalog-managed offer are **not permitted**: with no Contract-authored trial terms they would have no auditable commercial basis. Trial **runtime, conversion, expiry, and extension** are normative in §6.10 (absorbed from the predecessor — §2.2); **Design** defines concrete fields and optional trial-specific events while preserving the status enum.
 
 **Rationale**: A Catalog-first trial definition keeps trial economics reproducible and auditable without a status-machine fork.
 
@@ -493,11 +526,57 @@ A commercial **trial** is **not** a `Subscription.status` value. Manifest §4.3 
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-fr-transition-request`
 
-All mutating operations SHOULD be modeled as **`TransitionRequest`** with `type ∈ { activate, suspend, resume, cancel, archive, changePlan, addAddOn, removeAddOn, updateQuantity, convertTrial, transfer, renew, unschedule, pauseCollection, resumeCollection, confirmAcceptance, extendTrial }`, `idempotencyKey`, `status ∈ { pending, approved, applied, failed }`. The base list is manifest §4.3; **`updateQuantity`** (§6.3), **`convertTrial`** (§6.10), and the SUB-D-08 completion set — **`renew`** (manual renewal, §6.5), **`unschedule`** (voids a pending scheduled intent, §6.1/AC 22), **`pauseCollection`**/**`resumeCollection`** (the §6.4 posture window), **`confirmAcceptance`** (§6.1 activation instants), **`extendTrial`** (§6.10, approval-gated), **`archive`** (the `cancelled → archived` retention edge, retention-job-submitted — 2026-07-28 review fix: Design slice 01 had it, this list had missed it) — are this-PRD extensions pending manifest alignment (§15). Without them, mutations the FRs already mandate would bypass the single commit path. High-risk types (e.g. **transfer**, **extendTrial**) require **Approval** records (manifest §4.3, §4.11). Duplicate `(subscriptionId, idempotencyKey)` MUST result in exactly **one** durable effect.
+All mutating operations SHOULD be modeled as **`TransitionRequest`** with `type ∈ { activate, suspend, resume, cancel, archive, changePlan, addAddOn, removeAddOn, updateQuantity, changeComposition, convertTrial, transfer, renew, unschedule, pauseCollection, resumeCollection, confirmAcceptance, extendTrial }`, `idempotencyKey`, `status ∈ { pending, approved, applied, failed }`. A request withdrawn before it is applied (§6.1 `fr-intent-protocol`) terminates as `failed` with the machine-readable reason `withdrawn` — no new status value. The base list is manifest §4.3; **`updateQuantity`** (§6.3), **`changeComposition`** (the order change intent, §6.3 `fr-composite-change`), **`convertTrial`** (§6.10), and the SUB-D-08 completion set — **`renew`** (manual renewal, §6.5), **`unschedule`** (voids a pending scheduled intent, §6.1/AC 22), **`pauseCollection`**/**`resumeCollection`** (the §6.4 posture window), **`confirmAcceptance`** (§6.1 activation instants), **`extendTrial`** (§6.10, approval-gated), **`archive`** (the `cancelled → archived` retention edge, retention-job-submitted — 2026-07-28 review fix: Design slice 01 had it, this list had missed it) — are this-PRD extensions pending manifest alignment (§15). Without them, mutations the FRs already mandate would bypass the single commit path. High-risk types (e.g. **transfer**, **extendTrial**) require **Approval** records (manifest §4.3, §4.11). Duplicate `(subscriptionId, idempotencyKey)` MUST result in exactly **one** durable effect.
 
 **Rationale**: A uniform request envelope gives idempotency, approval hooks, and audit one shape.
 
 **Actors**: `cpt-cf-bss-subscriptions-actor-partner-admin`, `cpt-cf-bss-subscriptions-actor-platform-operator`
+
+#### Order-originated acquisition (two-phase create and activate)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-fr-order-originated-create`
+
+Commercially initiated acquisitions arrive from **Orders Workflow** as per-line intents in two waves ([orders-lifecycle PRD](../../orders-lifecycle/docs/PRD.md) `fr-order-atomic-fulfillment`, [orders-workflow PRD](../../orders-workflow/docs/PRD.md) `fr-owf-provisioning-intent`). This gear MUST honour that shape:
+
+1. **Create in `draft`, activate separately.** `create` and `activate` MUST remain two externally callable operations; the order path MUST NOT be served by a create-and-activate shortcut. A draft is not resource-affecting: no Policy gate, no OSS leg, no billable facts (SUB-D-11). Order-level atomicity rests on this pair (SEAMS SUB-O3).
+2. **Order reference.** `create` MUST accept an optional order reference — `orderId`, `orderVersion`, `orderLineId`, and the order's external reference where present — persist it on the aggregate, and carry it on that subscription's lifecycle events and billable facts (§6.8). A subscription created outside the order path carries none, so the two are distinguishable (SEAMS SUB-O2).
+3. **Dedup key.** `create` MUST accept a caller-supplied idempotency key and honour it as the constructor dedup key (§4.1). On the order path the caller derives it from `orderId`, `orderVersion`, line and wave, so an intent from a later `orderVersion` is a different operation and is never absorbed as a duplicate of a superseded version.
+4. **Composition at create.** One order line creates exactly **one** subscription carrying the line's quantity; a bundle plan is one line and one subscription. Add-ons selected on the line ([orders-changes PRD](../../orders-changes/docs/PRD.md) `fr-chg-addon-selection`) MUST arrive with `create`, so the draft holds the full composition, validated against the plan's published add-on rules (required, eligible, min/max/step).
+5. **Start instant.** The subscription start is `serviceActivatedAt`, stamped at the `activate` commit (SUB-D-05). It MUST NOT be taken from any date carried on the order, nor supplied by the caller. The order path dispatches activation only once expected fulfillment time is reached, so the commit instant is the actual activation instant; billing, entitlements and the term are never backdated to an earlier quoted service date (SEAMS SUB-O10).
+6. **Price and market.** The line's catalog price pin is the catalog segment of the subscription's snapshot. This gear binds `(currency, region)` from the payer's commercial profile at activation (§6.2 Snapshot discipline) and MUST reject activation with a machine-readable **market-divergence** reason where that binding differs from the currency and region the line was priced in.
+7. **At-sale money** is emitted at activation, never in `draft` (§9.2 one-time lane).
+8. **Compensation.** Before activation the order path compensates with the draft void (§6.1 Status enum); after activation, with a `cancel` carrying reason **`order_compensation`** (`fr-cancel-reasons`).
+9. **Direct path.** `create` without an order reference remains available for system, migration and operator paths, and for deployments running before the order path ships. Once the order path is live in a deployment, commercially initiated creates MUST carry an order reference; whether a deployment enforces that is a policy setting, not a separate operation.
+
+**Rationale**: The order is the auditable record of a commercial acquisition (price pin, approval, booking), and all-or-nothing fulfillment across lines is cheap only because nothing is live or billed before activation. Without the reference, the dedup rule and a commit-stamped start, the order path either loses provenance, double-creates under retry, or backdates service.
+
+**Actors**: `cpt-cf-bss-subscriptions-actor-orders`, `cpt-cf-bss-subscriptions-actor-platform-operator`
+
+#### Cancellation reasons
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-fr-cancel-reasons`
+
+Every `cancel` MUST carry one reason from a **closed, versioned** set: `customer`, `operator`, `term_expired`, `nonpayment_exhausted`, `saga_superseded`, `order_compensation`. `order_compensation` is used only by the order path to roll back a subscription activated by an order whose fulfillment then failed. It is **outside** the early-termination class and derives neither an early-termination fee nor an unused-portion credit (SUB-D-25 scopes that class to `customer`/`operator`). Operational compensation does not retract posted at-sale money: a one-time fact already emitted stays posted, and its reversal is a Billing-chain artifact (credit note / adjustment) triggered by the compensation cancel. A new reason value is a breaking change for consumers, so the set MUST be fixed before Billing consumes `SubscriptionCancelled` (SEAMS SUB-O1).
+
+**Rationale**: An order rollback is neither a customer-initiated early termination nor a plan-change supersession; reusing either value misstates the audit trail and derives money that is not owed.
+
+**Actors**: `cpt-cf-bss-subscriptions-actor-orders`, `cpt-cf-bss-subscriptions-actor-billing`
+
+#### Caller intent protocol (acceptance, withdrawal, status, identity)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-fr-intent-protocol`
+
+For callers that orchestrate transitions asynchronously — Orders Workflow first, any system actor thereafter — this gear MUST provide:
+
+1. **Resubmit and in-flight signal.** A resubmit with the same idempotency key MUST return the existing request and its current status (`pending`, `approved`, or terminal) — never a second effect and never a generic error — so the caller reads "already accepted" machine-readably (SEAMS SUB-O11; AC 2). A *different* resource-affecting request against a subscription with an in-flight resource transition is rejected `transition_in_flight` (Design slice 01 §3.6 in-flight single-writer rule).
+2. **Withdrawal.** A request that is accepted but not yet applied MUST be withdrawable by its submitter, and terminates as `failed` with reason `withdrawn`. Where no OSS leg has been dispatched, the withdrawal has no effect on the subscription. Where a work order is already outstanding (an OSS-blocking edge in `approved`), withdrawal follows the superseding-action rule of Design slice 01 §3.6: the work order is idempotently cancelled with a compensating deprovision and audit, and the request terminates only after that completes. An applied request cannot be withdrawn; it is superseded by a compensating transition (SEAMS SUB-O12).
+3. **Status read.** A request's status MUST be readable by its `TransitionRequest` identifier and, for order-originated requests, by `orderId` + `orderVersion` + `orderLineId` + wave, including after the idempotency key's lifetime has passed (SEAMS SUB-O13).
+4. **Identity echo.** Every confirmation and failure MUST echo the envelope received on the request: the order reference where present, wave, idempotency key, the caller's `correlationId`, the caller's opaque binding reference, and the asserting principal. The binding reference is opaque here and MUST NOT be interpreted as order state (SEAMS SUB-O16).
+5. **Correlation propagation.** The caller's `correlationId` MUST travel on the Policy Engine and OSS legs this gear drives for that request (SEAMS SUB-O14).
+
+**Rationale**: A caller that cannot tell "accepted" from "lost", cannot abandon an accepted request, and cannot look one up after its key ages out can only retry blindly — the inference that produces double provisioning.
+
+**Actors**: `cpt-cf-bss-subscriptions-actor-orders`, `cpt-cf-bss-subscriptions-actor-platform-operator`
 
 #### Scheduled lifecycle intents
 
@@ -513,7 +592,7 @@ All mutating operations SHOULD be modeled as **`TransitionRequest`** with `type 
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-fr-activation-instants`
 
-The aggregate MUST record three commercial instants as attributes/evaluated fields — **`contractEffectiveAt`** (booking; referenced from the Contract), **`serviceActivatedAt`** (stamped at the `activate` commit), and **`customerAcceptedAt`** (stamped by an optional **acceptance confirmation** operation where the Contract carries acceptance clauses; absent clauses ⇒ it equals service activation per the Contract default). **No new statuses**: pending-activation / pending-acceptance interim states are rejected — the manifest enum stays closed, `draft` covers the pre-activation window. All three instants MUST ride the lifecycle events and the ASC input hooks (§5.1); recognition semantics stay Finance/Billing. (Decision SUB-D-05.)
+The aggregate MUST record three commercial instants as attributes/evaluated fields — **`contractEffectiveAt`** (booking; referenced from the Contract), **`serviceActivatedAt`** (stamped at the `activate` commit), and **`customerAcceptedAt`** (stamped by an optional **acceptance confirmation** operation where the Contract carries acceptance clauses; absent clauses ⇒ it equals service activation per the Contract default). For an **order-originated** subscription whose order recorded buyer acceptance (orders-lifecycle `OrderAcceptanceRecorded`), `customerAcceptedAt` MUST be taken from that record and no second confirmation is required; the order path and `confirmAcceptance` MUST NOT both stamp it. An uncontracted subscription (§6.5) has no `contractEffectiveAt`. **No new statuses**: pending-activation / pending-acceptance interim states are rejected — the manifest enum stays closed, `draft` covers the pre-activation window. All three instants MUST ride the lifecycle events and the ASC input hooks (§5.1); recognition semantics stay Finance/Billing. (Decision SUB-D-05.)
 
 **Rationale**: Enterprise/channel deals with acceptance clauses need booking, service, and acceptance instants for correct revenue timing — a single `activatedAt` collapses them.
 
@@ -571,6 +650,20 @@ A subscription created under a storefront brand MUST record the per-sale **`bran
 
 **Actors**: `cpt-cf-bss-subscriptions-actor-rating`
 
+#### Usage attribution binding
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-fr-usage-attribution`
+
+Usage records reach Rating from the Usage Collector keyed by tenant, usage type and resource or subject reference, with **no** `subscriptionId`, SKU or payer — the collector deliberately carries no commercial identity. This gear MUST therefore own the attribution binding: an **effective-dated** link from each provisioned resource or subject to the subscription and component (`lineKey`) that provisioned it, opened when OSS confirms provisioning (§9.2 OSS provisioning contract), closed at deprovision, and kept across ownership transfer (§6.6). It MUST expose an as-of read `(tenant, resource_ref | subject_ref, t) → (subscriptionId, lineKey)` for Rating's usage normalizer (rating SEAMS UC3(b)). The read MUST:
+
+- answer for any `t` inside the Usage Collector replay/retention horizon and the correction window, so late and backfilled usage resolves to the component and payer it was consumed under;
+- return an explicit **no match** or **ambiguous** outcome, never a best guess, so Rating can quarantine the record;
+- let Rating re-key attributed usage onto the subscription's pinned ordering partition (`orderingTenantId`, §6.7) before any ordering-sensitive step.
+
+**Rationale**: The binding is born at provisioning, which this gear drives; no other gear holds both sides of it. Without an owner no usage record can be attributed to a subscription, and usage-to-cash does not close.
+
+**Actors**: `cpt-cf-bss-subscriptions-actor-rating`, `cpt-cf-bss-subscriptions-actor-oss-provisioning`
+
 ### 6.3 Plan Changes (Upgrade / Downgrade)
 
 #### Change boundary and mode
@@ -623,7 +716,9 @@ A **commercial effective date** in the past for `PlanLink` MAY be allowed only w
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-fr-overlap-cardinality`
 
-The manifest does **not** define global cardinality. **Default (resolved):** at most **one** **`active`** subscription per **`overlapScopeKey`**, where **`overlapScopeKey`** defaults to **`(payerTenantId, catalogSubscriptionProductKey)`** — `catalogSubscriptionProductKey` is the stable Catalog key for the sellable subscription product or family, owned by the Catalog registry; **Design** binds the stored field to a published SKU/product key. **Multiple concurrent `active`** subscriptions are **allowed** when they differ on **`overlapScopeKey`** (e.g. different **`resourceTenantId`**, **region**, **environment**, or **billing sub-account** when those dimensions are part of the key) or when the **Catalog** product template or **Contract** explicitly sets **`maxConcurrentActive` > 1** (or **unlimited** for wholesale/marketplace templates). If neither Catalog nor Contract sets a limit, **`maxConcurrentActive` = 1** for the default key applies. **Detection**: on **every entry into `active`** (`activate` **and** `resume`) **and on every committed change that mutates the key** (`changePlan` altering `catalogSubscriptionProductKey`; ownership **transfer** altering `payerTenantId`, §6.6), evaluate **`overlapScopeKey`** + **`maxConcurrentActive`**; reject or **queue** resolution **fail-closed** when the rule would break idempotent billing. A **cancel+new replacement** (cross-currency/region/frequency, §6.3) MAY overlap at the handover boundary only via an explicit **`supersedesSubscriptionId`** linkage — the successor's activation is exempt from the rule against exactly the subscription it supersedes, and only until that one's scheduled end. The replacement's preview/confirmation surface MUST disclose, before execution, any credit forfeiture **and the loss of grandfathered price protection** where the predecessor's pinned price is in a protected cohort — the cohort never carries across the pair (SUB-D-26, 2026-08-01).
+The manifest does **not** define global cardinality. **Default (resolved):** at most **one** **`active`** subscription per **`overlapScopeKey`**, where **`overlapScopeKey`** defaults to **`(payerTenantId, catalogSubscriptionProductKey)`** — `catalogSubscriptionProductKey` is the stable Catalog key for the sellable subscription product or family, owned by the Catalog registry; **Design** binds the stored field to a published SKU/product key (dependency SEAMS SUB-G1: the registry does not expose the key yet). **Multiple concurrent `active`** subscriptions are **allowed** when they differ on **`overlapScopeKey`** (e.g. different **`resourceTenantId`**, **region**, **environment**, or **billing sub-account** when those dimensions are part of the key) or when the **Catalog** product template or **Contract** explicitly sets **`maxConcurrentActive` > 1** (or **unlimited** for wholesale/marketplace templates). If neither Catalog nor Contract sets a limit, **`maxConcurrentActive` = 1** for the default key applies. **Detection**: on **every entry into `active`** (`activate` **and** `resume`) **and on every committed change that mutates the key** (`changePlan` altering `catalogSubscriptionProductKey`; ownership **transfer** altering `payerTenantId`, §6.6), evaluate **`overlapScopeKey`** + **`maxConcurrentActive`**; reject or **queue** resolution **fail-closed** when the rule would break idempotent billing. A **cancel+new replacement** (cross-currency/region/frequency, §6.3) MAY overlap at the handover boundary only via an explicit **`supersedesSubscriptionId`** linkage — the successor's activation is exempt from the rule against exactly the subscription it supersedes, and only until that one's scheduled end. The replacement's preview/confirmation surface MUST disclose, before execution, any credit forfeiture **and the loss of grandfathered price protection** where the predecessor's pinned price is in a protected cohort — the cohort never carries across the pair (SUB-D-26, 2026-08-01).
+
+**Occupancy read and atomic enforcement.** This gear MUST expose a batched **overlap occupancy** read: for each `(payerTenantId, overlapScopeKey)` it returns the number of `active` subscriptions holding the key (drafts excluded), the effective `maxConcurrentActive`, and the policy it came from — `catalog`, `contract`, or `platform_default` (the default of 1 above). The effective limit is always returned, so no caller has to assume one; a presence flag alone cannot evaluate a limit above one (SEAMS SUB-O5 as amended by the orders-lifecycle design). A read-time check is an early abort only: the rule MUST be enforced **atomically** where a subscription commits to `active` — re-evaluated and committed under one reservation or serialization boundary — so two concurrent activations cannot jointly exceed the limit. **Self-exemption for changes:** a `changeComposition` that adds a component to a subscription MUST NOT count that subscription against itself; the rule still applies between it and every other subscription and is evaluated inside the change's commit (§6.3 `fr-composite-change`).
 
 **Rationale**: An explicit default cardinality with a Catalog-owned key prevents double-billing without blocking legitimate multi-instance sales.
 
@@ -638,6 +733,27 @@ The manifest does **not** define global cardinality. **Default (resolved):** at 
 **Rationale**: Mid-period seat growth is the most frequent commercial mutation on B2B subscriptions; without a transition it has no Policy gate, no proration boundary, and no provenance.
 
 **Actors**: `cpt-cf-bss-subscriptions-actor-customer`, `cpt-cf-bss-subscriptions-actor-rating`
+
+#### Order change intent (transactional multi-item increase)
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-fr-composite-change`
+
+A change order reaches this gear as **one** `changeComposition` request against one subscription ([orders-changes PRD](../../orders-changes/docs/PRD.md) `contract-chg-change-intent`): several quantity increases and component (add-on) additions, each item carrying its `orderLineId`, change kind, added quantity or component, delta price pin and optional requested effective date, plus the order reference, the process `correlationId` and an **expected revision**. This gear MUST:
+
+1. **Commit all-or-nothing.** Apply every item in one commit or none; a failure leaves the subscription unmodified and needs no compensation (CHG-S2).
+2. **Check inside the commit**, not beforehand: the expected revision equals the current `version`; the subscription is non-terminal; the resulting composition satisfies the plan's add-on rules (required, eligible, min/max/step); the overlap rule holds against every *other* subscription, with the target exempt (§6.3 Overlapping subscriptions; CHG-S2, CHG-S3). Any failing check rejects the request with a machine-readable reason.
+3. **Augment, never replace.** The subscription keeps its identity; a change intent MUST NOT be expressed as cancel-and-replace (`supersedesSubscriptionId` stays reserved for the §6.3 cross-boundary replacement).
+4. **Effective date.** A requested effective date becomes that item's future `changeEffectiveAt`, held as a scheduled change intent on the aggregate — the SUB-D-01/SUB-D-04 mechanism, with no new `changeMode` value (the envelope stays `immediate | next-cycle | end-of-term`); absent a date, the increase takes effect at application. This gear owns the boundary, the proration trigger and the billing consequences (CHG-S5). A requested date in the past MUST be rejected. How all-or-nothing holds for a change intent whose items carry different future dates is open (§15).
+5. **Trace.** Persist the order reference per applied item and echo `orderLineId` per item on the confirmation (CHG-S1); the composition-changing events carry it (AC 11).
+6. **Expose acceptance.** Durable acceptance of the request is the order's cancellation boundary (orders-changes `fr-chg-atomic-apply`), so acceptance MUST be observable through the status read (§6.1 `fr-intent-protocol`).
+
+A **composition read** MUST return what the subscription currently carries — plan line, add-ons and quantities — together with the revision the expected-revision precondition is expressed against (CHG-S4).
+
+This phase covers **increases** only. Decreases, removals and plan changes are not order-driven yet and keep using the direct `updateQuantity`, `removeAddOn` and `changePlan` operations; the §6.3 up/down asymmetry is unchanged.
+
+**Rationale**: The target is live from the start, so the only compensation for a partial failure would be a decrease, which has no authored owner. A transactional commit with in-commit checks removes the need for a saga.
+
+**Actors**: `cpt-cf-bss-subscriptions-actor-orders`, `cpt-cf-bss-subscriptions-actor-customer`
 
 #### Committed multi-step schedules (ramps)
 
@@ -687,7 +803,7 @@ The inverse of suspension MUST also be representable: a **`collectionPaused`** p
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-fr-renewal-evaluation`
 
-Contract §4.6 is the source: the `Renewal` entity includes `autoRenew(bool)` and term `(start,end)`; **evergreen** and **notice periods** are called out as manifest risks — product MUST define notice/opt-out behavior in contract templates. The Subscriptions **renewal job** evaluates `endDate` / term, emits the **renewal attempted** outcome; on success it extends the term; on failure it triggers the **failed renewal** path. **Every successful renewal — auto and manual alike — re-resolves the pricing-side snapshot refs eligibility-first** (SUB-D-14 as amended 2026-07-28): a non-grandfathered subscription re-binds to the current eligible row (supersessions propagate at renewal); a **grandfathered** subscription keeps its pinned generation — the refresh carries `priceEligibility` + `cohort` forward — and re-binds away **only at the first renewal after its generation's `grandfatherUntil` has passed** (pricing's `EligibilityExpirySignal`). A subscription with **`autoRenew = false`**, no pending intent, and no manual `renew` at `endDate` ends by a system-derived **end-of-term cancel** (reason `term_expired`; SUB-D-13) — it never lingers `active` unbilled.
+The bound Contract is the source — the contracts gear authors `autoRenew`, the renewal term window and the notice ladder (`fr-renewal-terms`); for an uncontracted subscription the platform defaults are (`fr-platform-defaults`). **Evergreen** and **notice periods** are called out as manifest risks — notice/opt-out behavior MUST be defined in the contract templates and in the platform defaults alike. The Subscriptions **renewal job** evaluates `endDate` / term, emits the **renewal attempted** outcome; on success it extends the term; on failure it triggers the **failed renewal** path. **Every successful renewal — auto and manual alike — re-resolves the pricing-side snapshot refs eligibility-first** (SUB-D-14 as amended 2026-07-28): a non-grandfathered subscription re-binds to the current eligible row (supersessions propagate at renewal); a **grandfathered** subscription keeps its pinned generation — the refresh carries `priceEligibility` + `cohort` forward — and re-binds away **only at the first renewal after its generation's `grandfatherUntil` has passed** (pricing's `EligibilityExpirySignal`). A subscription with **`autoRenew = false`**, no pending intent, and no manual `renew` at `endDate` ends by a system-derived **end-of-term cancel** (reason `term_expired`; SUB-D-13) — it never lingers `active` unbilled.
 
 **Rationale**: Renewal is Contract-driven; Subscriptions executes and audits it.
 
@@ -719,7 +835,7 @@ Before an auto-renewal the system MUST emit **renewal notices** at configurable 
 
 | **Stage** | **Behavior** |
 |-----------|--------------|
-| Payment pre-check fails | Subscription remains **`active`** during **grace** (default **7 calendar days** unless **Contract** / regional template specifies another value within **Legal** bounds); then **`suspended`** or **`cancelled`** per the **grace policy** and contract ladder — Design encodes timers and Payments signals |
+| Payment pre-check fails | Subscription remains **`active`** during **grace** (default **7 calendar days** unless the bound **Contract** specifies another value, never below the **regional template**'s statutory minimum); then **`suspended`** or **`cancelled`** per the **grace policy** and contract ladder — Design encodes timers and Payments signals |
 | Post-renewal billing failure | Hand off to **dunning** (Billing/Payments §4.4–4.5); the same **grace** rules and triggers apply |
 | Idempotency | Renewal attempts keyed to prevent **double term extension** |
 
@@ -733,17 +849,32 @@ Before an auto-renewal the system MUST emit **renewal notices** at configurable 
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-fr-grace-policy`
 
-These rules make **grace** operationally testable; **Contract** MAY override durations and ladder within **Legal** min/max where published.
+These rules make **grace** operationally testable; a bound **Contract** MAY override durations and ladder, never below the regional template's statutory minimum (contracts `fr-grace-regional`).
 
-1. **Default duration before suspension:** **7 calendar days** from **grace start** (first auditable **failed renewal pre-check** or **aligned post-renewal billing failure** for the renewal attempt). **Jurisdiction:** where **Legal** requires different bounds, the effective duration MUST come from **Contract** (or the seller **regional template** referenced at sign); otherwise **7 days** is the platform default.
+1. **Default duration before suspension:** **7 calendar days** from **grace start** (first auditable **failed renewal pre-check** or **aligned post-renewal billing failure** for the renewal attempt). **Jurisdiction:** where a regional template sets a statutory minimum, the effective duration MUST come from the bound **Contract** (floor-checked by the contracts gear) or, for an uncontracted subscription, from the platform defaults of that territory; otherwise **7 days** is the platform default.
 2. **Recurring during grace:** **`BillableItem(kind=recurring)` for the renewal term that is blocked by the failure MUST NOT be emitted while grace runs**; on renewal **success** (including a §6.5(5) late success and the SUB-D-13 post-suspension revival) it is emitted with its original key; on **grace resolving to failure it is never emitted** — a fact must never exist for a term that never started (wording aligned 2026-08-01 to the 2026-07-28 billing-pass fix, wave-3 review #19a: the earlier "until … or grace resolves to failure" literally licensed emitting on failure, and the PRD is the requirement source). **Usage-rated** charges **MAY continue** until **`suspended`** unless **Contract** or **Policy** explicitly freezes usage for the grace window.
-3. **Per-contract configurability and SoR:** **configurable per contract** (or per contract template). **Authoritative** commercial terms (**grace length**, ladder, billing posture) live on **Contract** / **`Renewal`** and related clauses (§4.6). **Subscription** MUST store **evaluated fields** (§1.4) at renewal evaluation time for **audit**, **idempotent** renewal jobs, and replay.
-4. **Grace → `suspended` (or `cancelled`) trigger:** **hybrid — whichever is first:** **(i)** the current grace interval **elapses** without successful renewal, **or** **(ii)** **Payments** declares **no further automated retries** for the failure. Move to **`cancelled`** per **contract-defined** steps after suspend or final dunning — with the platform-default terminal step while Contracts is unauthored (SUB-D-16): a nonpayment `suspended` subscription dwells at most **90 days** (tenant-configurable; a Contract ladder overrides), then a system `cancel` (reason `nonpayment_exhausted`) fires; the effective dwell is **resolved and stored at suspension time** as an evaluated field (rule 3 discipline) — later configuration or Contract changes govern future suspensions only, never an in-flight deadline; the post-suspension revival path (grace policy 5a / Design §4.3b) is bounded by the dwell.
+3. **Per-contract configurability and SoR:** **configurable per contract** (or per contract template). **Authoritative** commercial terms (**grace length**, ladder, billing posture) live on the bound **Contract** (contracts gear `fr-grace-regional`) and, for an uncontracted subscription, on the platform defaults (`fr-platform-defaults`). **Subscription** MUST store **evaluated fields** (§1.4) at renewal evaluation time for **audit**, **idempotent** renewal jobs, and replay.
+4. **Grace → `suspended` (or `cancelled`) trigger:** **hybrid — whichever is first:** **(i)** the current grace interval **elapses** without successful renewal, **or** **(ii)** **Payments** declares **no further automated retries** for the failure. Move to **`cancelled`** per **contract-defined** steps after suspend or final dunning — with the platform-default terminal step where the bound Contract defines none and for every uncontracted subscription (SUB-D-16): a nonpayment `suspended` subscription dwells at most **90 days** (tenant-configurable; a Contract ladder overrides), then a system `cancel` (reason `nonpayment_exhausted`) fires; the effective dwell is **resolved and stored at suspension time** as an evaluated field (rule 3 discipline) — later configuration or Contract changes govern future suspensions only, never an in-flight deadline; the post-suspension revival path (grace policy 5a / Design §4.3b) is bounded by the dwell.
 5. **Late success inside grace (term continuity):** when renewal succeeds during grace, the new term MUST start at the **old term end** (backdated — continuous coverage, no gap), and the previously blocked next-term recurring is emitted with its **original** `(subscriptionId, billing period, lineKey)` key. **Resume after a grace-driven suspension** requires the blocking payment failure to be **resolved** (successful renewal/payment, or an audited operator override) — `resume` alone MUST NOT restore unpaid service (§6.1 guard table).
 
 **Rationale**: Grace defaults answered in the PRD (not left to Design) are what make the ladder product-testable.
 
 **Actors**: `cpt-cf-bss-subscriptions-actor-contracts`, `cpt-cf-bss-subscriptions-actor-payments`
+
+#### Platform defaults and contract binding
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-fr-platform-defaults`
+
+A Contract is optional ([orders-lifecycle PRD](../../orders-lifecycle/docs/PRD.md) `fr-order-create`; [contracts PRD](../../contracts/docs/PRD.md) `fr-renewal-terms`). The aggregate MUST carry an optional **contract binding** (`contractId` and contract version), and:
+
+1. **Uncontracted is first-class.** A subscription with no binding is governed by the **platform defaults** (§1.4): auto-renewal, term (fixed length or evergreen), billing anchor instant (the activation instant, `serviceActivatedAt`; the bound price's `billingAnchorPolicy` then places the boundaries), notice ladder (30/14/7/1 days), grace (7 days), nonpayment dwell (90 days), acceptance requirement (none), concurrent-active cardinality (1). The set MUST be complete — every rule in this PRD that names the Contract as the source of a term resolves, for an uncontracted subscription, from this set — and is published per tenant within platform bounds. The default auto-renewal and default term values are open (§15).
+2. **Explicit switch.** A bound Contract's terms supersede the defaults for that subscription only through a recorded binding with an effective instant; a contract existing for the same payer MUST NOT change a subscription's terms implicitly (contracts `fr-renewal-terms`). Whether a new binding changes the in-flight term or only the next one is open (§15).
+3. **Evaluated fields with provenance.** Whatever the source, the terms in force are stored as evaluated fields at evaluation time together with their provenance (`contract` + version, or `platform_default`), so replay and audit do not depend on today's defaults (grace policy rule 3).
+4. **Contract end.** `ContractTerminated` and the contract-expired event for a bound contract MUST be consumed and recorded on the aggregate; the resulting subscription behaviour — end-of-term cancel, or reversion to the platform defaults — is open (§15) and MUST be decided before the contracts gear publishes those events.
+
+**Rationale**: Contracts is a first-draft gear and self-service orders typically carry no contract, so the defaults are what most subscriptions will run on. Specified as a state, they cannot silently harden into de-facto terms that later change under live customers.
+
+**Actors**: `cpt-cf-bss-subscriptions-actor-contracts`, `cpt-cf-bss-subscriptions-actor-platform-operator`
 
 ### 6.6 Multi-Tenant Ownership
 
@@ -756,6 +887,8 @@ These rules make **grace** operationally testable; **Contract** MAY override dur
 | `resourceTenantId` | Operational owner of resources tied to the subscription |
 | `payerTenantId` | Financial responsibility (consolidated billing) |
 | `sellerTenantId` | Channel/marketplace seller when applicable |
+
+For an order-originated subscription the axes are taken from the order, fixed at order submit. The party that placed the order is recorded as the **initiating actor** — an authorization and audit attribute, not a fourth axis.
 
 **Rationale**: The three axes are the multi-tenant backbone every downstream consumer keys on.
 
@@ -807,7 +940,7 @@ This PRD MUST NOT enumerate **event attribute/extension names** or wire formats;
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-fr-event-consumers`
 
-**OSS Provisioning** acts on subscription/entitlement changes; **Policy Engine** receives post-change confirmations as required by integration Design; **Billing** ingests recurring items and aligns periods/proration; **Analytics/DWH** consumes facts.
+**OSS Provisioning** acts on subscription/entitlement changes; **Policy Engine** receives post-change confirmations as required by integration Design; **Billing** ingests recurring items and aligns periods/proration; **Orders Workflow** consumes the per-intent confirmations and failures of the requests it submitted (§6.1 `fr-intent-protocol`); **Analytics/DWH** consumes facts.
 
 **Rationale**: The manifest §4.3 consumer list bounds who may depend on these streams.
 
@@ -849,7 +982,7 @@ Posted invoice lines MUST NOT be rewritten; subscription corrections emit **new*
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-fr-billing-traceability`
 
-Items MUST trace **per component**: each item carries **`subscriptionId`**, its **`lineKey`**, and **its own component's** **`skuId`/`planId`/`priceId`** + **`pricingSnapshotRef`** (manifest §4.4 itemization; SUB-D-19 — re-scoped 2026-08-01, wave-3 review #7: the singular tuple would stamp the plan's catalog keys on add-on lines).
+Items MUST trace **per component**: each item carries **`subscriptionId`**, its **`lineKey`**, and **its own component's** **`skuId`/`planId`/`priceId`** + **`pricingSnapshotRef`** (manifest §4.4 itemization; SUB-D-19 — re-scoped 2026-08-01, wave-3 review #7: the singular tuple would stamp the plan's catalog keys on add-on lines). Items of an **order-originated** component additionally carry the **order reference** of the line that sold it — `orderId`, `orderLineId`, and the order's external reference where present — because billing documents derive from the subscription, not from order events; without it a purchase-order number shown on the order never reaches the invoice.
 
 **Rationale**: Charge-to-catalog lineage is what partners and auditors reconcile against.
 
@@ -923,7 +1056,7 @@ A trial subscription MUST be created from a **Catalog-defined trial offer** (tri
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-fr-trial-conversion`
 
-At trial end the system MUST convert per the plan's phase schedule (`convertsToPhaseId`): advance the phase boundary, authorize payment where required (Payments, per Design — without re-entering payment details where a method is on file), re-issue entitlements per the target phase's grant set with **continuity** (no access gap), and emit the composition-changing event. A payment failure at conversion follows the §6.5 grace ladder. Conversion processing MUST be idempotent (**zero missed / zero double conversions**).
+At trial end the system MUST convert per the plan's phase schedule (`convertsToPhaseId`): advance the phase boundary, authorize payment where required (Payments, per Design — without re-entering payment details where a method is on file), re-issue entitlements per the target phase's grant set with **continuity** (no access gap), and emit the composition-changing event. Where the target phase is paid, the boundary MUST NOT advance without a **valid payment method on file**: an unconverted trial with no method follows the expiry path (`fr-trial-expiry`) and no paid-phase entitlement is issued. A payment **failure** with a valid method on file follows the §6.5 grace ladder. Conversion processing MUST be idempotent (**zero missed / zero double conversions**).
 
 **Rationale**: Conversion is the revenue moment of a trial; it must be deterministic, continuous, and ladder-protected.
 
@@ -999,7 +1132,13 @@ Horizontal partitioning by tenant for subscription reads/writes; support **100K+
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-subscriptions-nfr-operational-baselines`
 
-Carried from the predecessor's module specifications, pending the same NFR-workshop reconciliation: state transition **p95 < 500ms**; subscription query **p95 < 200ms**; entitlement update propagation to the check surface **< 5s**; event delivery to consumers **p95 < 30s**; recurring charge accuracy **100%** with **zero duplicates** (§6.8).
+Carried from the predecessor's module specifications, pending the same NFR-workshop reconciliation: state transition **p95 < 500ms** (the predecessor's figure; where it conflicts with `nfr-lifecycle-latency`, the 1 s synchronous-commit bound governs until the workshop sets one number); subscription query **p95 < 200ms**; entitlement update propagation to the check surface **< 5s**; event delivery to consumers **p95 < 30s**; recurring charge accuracy **100%** with **zero duplicates** (§6.8).
+
+#### Intent seam budget for orchestrating callers
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-nfr-intent-seam-budget`
+
+For the intents of §6.1 `fr-intent-protocol`, this gear MUST publish a p95 and p99 for **accepting** an intent and for **confirming** it (excluding the OSS-paced provisioning leg, as in `nfr-lifecycle-latency`), the sustained submission rate a caller may offer, and the back-pressure signal returned above that rate (SEAMS SUB-O15). Values are set at the NFR workshop; until then callers size their step deadlines against the §7.1 baselines.
 
 ### 7.2 NFR Exclusions
 
@@ -1014,7 +1153,7 @@ Carried from the predecessor's module specifications, pending the same NFR-works
 | **🚀 Efficiency** | Bulk read models for account rollups; avoid N+1 Policy calls via batch where contractually safe; **95% reduction in manual subscription operations** — zero manual intervention for standard lifecycle transitions. | Subscription lists power portals and support at scale; manual ops do not scale past ~1000 customers. |
 | **🔒 Reliability** | State machine + idempotency + ordering invariants; **zero missed recurring charges**; DLQ/replay for failed transitions; daily reconciliation checks (§17.1). | Revenue and entitlement mistakes are existential risk; missed charges are silent leakage. |
 | **⚡ Performance** | The §7.1 baselines: lifecycle control-plane **p95 < 1s**; entitlement check **p95 < 100ms**; recurring generation **daily by 00:00**; proration alignment **100% accuracy**; horizontal partitioning by tenant. Baseline from the predecessor PRD (PRD-0001 SLAs) — the program NFR workshop overrides if in conflict. | The same SLAs block onboarding and billing accuracy at scale; explicit targets make the vector testable. |
-| **🛡️ Security** | Strict tenant isolation; delegation proofs for cross-tenant ops; audit on every transition with SOX-grade correlation IDs; encryption at rest and in transit. | Commercial data is sensitive; cross-tenant leakage is critical severity. |
+| **🛡 Security** | Strict tenant isolation; delegation proofs for cross-tenant ops; audit on every transition with SOX-grade correlation IDs; encryption at rest and in transit. | Commercial data is sensitive; cross-tenant leakage is critical severity. |
 | **🔄 Versatility** | Support multiple commercial models (usage, recurring, hybrid, fixed-term, evergreen, prepaid) via `PlanLink`/add-ons and Contract terms without breaking aggregate ordering; extensible entitlement types (flags, quotas, limits). | Channel SKUs and enterprise deals vary widely; product evolution requires extensible entitlements. |
 
 ## 9. Public Library Interfaces
@@ -1029,12 +1168,18 @@ Carried from the predecessor's module specifications, pending the same NFR-works
 
 | **Operation** | **Verb(s)** | **Idempotency / concurrency (requirements)** |
 |---------------|-------------|-----------------------------------------------|
-| create | `create` | **Idempotency key** on create |
+| create | `create` | Caller-supplied **idempotency key**, deduped on `(orderingTenantId, operation, key)` (§4.1); optional **order reference** and the line's add-on selection (§6.1 `fr-order-originated-create`) |
 | get / list | `get`, `list` | — |
-| activate / suspend / resume / cancel | `activate`, `suspend`, `resume`, `cancel` | **Idempotency key** + **optimistic concurrency** on subscription **version** (Design maps to concrete headers); `cancel` carries `cancelMode`, `suspend` MAY carry `resumeAt` (§6.1) |
+| activate / suspend / resume / cancel | `activate`, `suspend`, `resume`, `cancel` | **Idempotency key** + **optimistic concurrency** on subscription **version** (Design maps to concrete headers); the start is the `activate` commit instant, never order- or caller-supplied; `cancel` carries `cancelMode` and a reason from the closed set (§6.1 `fr-cancel-reasons`); `suspend` MAY carry `resumeAt` (§6.1) |
 | plan change | `changePlan` | same |
 | add-on change | `addAddOn`, `removeAddOn` | same |
 | quantity change | `updateQuantity` | same; §6.3 envelope (SUB-D-02) |
+| order change intent | `changeComposition` | idempotency key + **expected revision** as precondition; all-or-nothing; per-item `orderLineId` echoed (§6.3 `fr-composite-change`) |
+| composition read | `getComposition` | read-only; current plan line, add-ons and quantities plus the revision a change is expressed against (§6.3) |
+| overlap occupancy read | `getOverlapOccupancy` | read-only, batched; per `(payerTenantId, overlapScopeKey)`: active count, effective `maxConcurrentActive`, provenance (§6.3) |
+| request status read | `getTransitionRequest` | read-only; by request identifier, or by `orderId` + `orderVersion` + `orderLineId` + wave (§6.1 `fr-intent-protocol`) |
+| withdraw accepted request | `withdrawTransitionRequest` | idempotency key; only before the request applies; an outstanding OSS work order is cancelled with a compensating deprovision first (slice 01 §3.6); ends it as `failed` with reason `withdrawn` (§6.1) |
+| usage attribution read | `resolveUsageAttribution` | read-only, batched, as-of `t`; explicit no-match / ambiguous outcomes (§6.2 `fr-usage-attribution`) |
 | trial conversion / extension | `convertTrial`, `extendTrial` | same; `extendTrial` requires **Approval** (§6.10) |
 | manual renewal | `renew` | same; keyed against double term extension (§6.5) |
 | un-schedule pending intent | `unschedule` | same; references the pending intent it voids (§6.1, AC 22) |
@@ -1066,7 +1211,19 @@ Carried from the predecessor's module specifications, pending the same NFR-works
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-contract-contracts-input`
 
-**Protocol/Format**: signed terms, `Renewal` (`autoRenew`, term windows), grace ladder / regional-template values, `PriceOverride` windows — consumed via events (`ContractSigned`, `ContractRenewed`, …) + read models; Subscriptions stores **evaluated fields** at renewal evaluation time (§6.5).
+**Protocol/Format**: from the **contracts** gear ([contracts PRD](../../contracts/docs/PRD.md) §6.2–§6.7): renewal terms (`autoRenew`, term window, notice ladder), grace ladder and regional-template values with statutory minima, ramps, `PriceOverride` windows, the booking instant and the acceptance-required declaration — consumed via its events (`ContractSigned`, `ContractRenewed`, `ContractAmended`, `ContractTerminated`, and the contract-expired event the contracts gear adds) + read models. `ContractSigned` supplies defaults and eligibility only; it creates no subscription (§4). Subscriptions stores **evaluated fields** with provenance at evaluation time and applies a contract's terms only through an explicit binding; unbound subscriptions run on the platform defaults (§6.5 `fr-platform-defaults`).
+
+#### Orders intent contract
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-contract-orders-intents`
+
+**Protocol/Format**: Orders Workflow submits per-line **draft-create** and **activation** intents (two waves), **draft-void** and **activated-cancel** compensation intents, and one **change intent** per change order. Every intent carries `orderId`, `orderVersion`, `orderLineId` (per item for a change intent), wave, the process `correlationId`, an opaque caller binding reference, and an idempotency key the caller derives from order, version, line and wave. This gear answers each with a confirmation or a failure echoing that envelope, rejects in-flight duplicates machine-readably, supports withdrawal of an accepted request and status lookup by order identity, and relays the `correlationId` to Policy Engine and OSS (§6.1 `fr-order-originated-create`, `fr-cancel-reasons`, `fr-intent-protocol`; §6.3 `fr-composite-change`). Counterparts: [orders-workflow PRD](../../orders-workflow/docs/PRD.md) `fr-owf-provisioning-intent`, [orders-changes PRD](../../orders-changes/docs/PRD.md) `contract-chg-change-intent`.
+
+#### Usage attribution contract
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-contract-usage-attribution`
+
+**Protocol/Format**: batched as-of read `(tenant, resource_ref | subject_ref, t) → (subscriptionId, lineKey)` over the effective-dated attribution binding, with explicit no-match and ambiguous outcomes, answerable over the Usage Collector replay/retention horizon and the correction window (§6.2 `fr-usage-attribution`). Counterpart: [rating SEAMS](../../rating/docs/SEAMS.md) UC3(b), consumed by the rating usage normalizer.
 
 #### Policy Engine gate contract
 
@@ -1163,6 +1320,49 @@ Carried from the predecessor's module specifications, pending the same NFR-works
 
 **Postconditions**:
 - Template changes flow through catalog publish; monitoring here is read-only.
+
+#### Order fulfillment spawns subscriptions
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-usecase-order-fulfillment`
+
+**Actor**: `cpt-cf-bss-subscriptions-actor-orders`
+
+**Preconditions**:
+- An approved `new_sale` order with N lines; payment authorization and, where required, buyer acceptance recorded on the order.
+
+**Main Flow**:
+1. Orders Workflow reads overlap occupancy for every line's key and the payer.
+2. Wave 1: one draft-create intent per line, with the order reference, the line's add-ons and quantity; each subscription is created in `draft`.
+3. Wave 2, once every create has succeeded and the latest service date is reached: one activation intent per line; the start is stamped at the activate commit; this gear binds `(currency, region)`, enforces the overlap rule atomically, runs the Policy/OSS legs and emits any one-time fact.
+4. Each confirmation echoes the intent envelope; Workflow acknowledges the order `completed` with the line → subscription mapping.
+
+**Postconditions**:
+- N `active` subscriptions, each carrying its order reference; billable facts trace to the order line.
+
+**Alternative Flows**:
+- **Create fails before any activation**: Workflow voids the drafts; no billable fact exists.
+- **Activation fails after others activated**: Workflow cancels the activated ones with reason `order_compensation`; no ETF or credit is derived; posted one-time facts are reversed in the billing chain.
+- **Market divergence or overlap collision at activation**: the line is rejected with a machine-readable reason; Workflow compensates.
+
+#### Change order increases a running subscription
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-usecase-change-order`
+
+**Actor**: `cpt-cf-bss-subscriptions-actor-orders`
+
+**Preconditions**:
+- An `active` target subscription; an approved change order with quantity increases and/or component additions against it.
+
+**Main Flow**:
+1. Orders Lifecycle reads the target's composition and revision for its delta gate.
+2. Orders Workflow submits one `changeComposition` intent carrying every line and the expected revision.
+3. This gear checks the revision, non-terminality, add-on bounds and cross-subscription overlap inside one commit and applies every item at its effective date.
+
+**Postconditions**:
+- The same subscription carries the increases; composition-changing events carry the per-line order reference.
+
+**Alternative Flows**:
+- **Revision mismatch or any failing check**: rejected as a whole with a machine-readable reason; the subscription is unchanged; the order is held for operator retry or cancel.
 
 ## 11. User Interaction and Design
 
@@ -1386,19 +1586,90 @@ Carried from the predecessor's module specifications, pending the same NFR-works
 **34. ETF derivation is reason-scoped and joins on the carried keys** *(SUB-D-18/25; added 2026-08-01)*
 - **Given** cancellations with reasons `customer`, `term_expired`, and `nonpayment_exhausted`
 - **When** Billing derives the Contracts-defined commercial consequence from `SubscriptionCancelled`
-- **Then** only the `customer` (and `operator`) cancel MAY yield an ETF or unused-portion credit; `term_expired`, `nonpayment_exhausted`, and `saga_superseded` MUST NOT
+- **Then** only the `customer` (and `operator`) cancel MAY yield an ETF or unused-portion credit; `term_expired`, `nonpayment_exhausted`, `saga_superseded`, and `order_compensation` MUST NOT
 - **And** the derivation MUST join on the event's term window + billing-period identity, never re-reading the aggregate at posting time
+
+### Orders, contracts, and usage attribution
+
+**35. Order-originated two-phase acquisition**
+- **Given** an approved order whose two lines are submitted as draft-create intents carrying the order reference
+- **When** both creates commit
+- **Then** two subscriptions MUST exist in `draft`, each carrying its `orderId`, `orderVersion` and `orderLineId`, with no Policy/OSS leg run and no billable fact emitted
+- **And** a repeated draft-create intent with the same caller-derived key MUST return the same subscription, while an intent derived from a later `orderVersion` MUST NOT be absorbed as its duplicate
+
+**36. Activation starts at the activate commit**
+- **Given** an order line whose quoted service date has passed while the activation wave waited for another line
+- **When** the activation intent commits
+- **Then** the subscription's start (`serviceActivatedAt`), term and first recurring period MUST begin at the commit instant — never at the quoted date and never at an instant supplied by the caller
+- **And** any one-time fact MUST be emitted at this activation, not before
+
+**37. Market divergence at activation**
+- **Given** a draft whose line was priced in one currency and region, and a payer whose commercial profile now binds another
+- **When** the activation intent is processed
+- **Then** activation MUST be rejected with the machine-readable market-divergence reason and the subscription MUST stay in `draft`
+
+**38. Order compensation cancel derives no money**
+- **Given** an order-activated subscription whose order fulfillment later failed
+- **When** it is cancelled with reason `order_compensation`
+- **Then** no early-termination fee or unused-portion credit MUST be derived
+- **And** a one-time fact already emitted MUST stay posted for Billing to reverse
+
+**39. Change intent applies all-or-nothing**
+- **Given** a `changeComposition` request with a quantity increase and a component addition, whose added component would breach the plan's add-on maximum
+- **When** the request is processed
+- **Then** it MUST be rejected as a whole with a machine-readable reason, the subscription `version` MUST be unchanged, and neither item MUST take effect
+- **And** a request whose expected revision differs from the current `version` MUST be rejected the same way
+
+**40. Overlap self-exemption and atomic enforcement**
+- **Given** a key with `maxConcurrentActive = 1`, a subscription holding it, and a second draft on the same payer and key
+- **When** a `changeComposition` adds a component to the first subscription, and separately the second draft is activated
+- **Then** the change MUST NOT be rejected for colliding with its own target
+- **And** the activation MUST be rejected with the overlap reason — including when two activations on the key race, of which at most one may commit
+- **And** the occupancy read for the key MUST report `activeCount = 1`, `maxConcurrentActive = 1` and its provenance
+
+**41. Resubmit, withdrawal, status read**
+- **Given** an accepted activation intent whose OSS work order is outstanding (`approved`)
+- **When** the caller resubmits it with the same key, then withdraws it, then reads it by `orderId` + `orderVersion` + `orderLineId` + wave
+- **Then** the resubmit MUST return the existing request with status `approved` and no second effect
+- **And** the withdrawal MUST cancel the work order with a compensating deprovision, leave the subscription in `draft`, and end the request as `failed` with reason `withdrawn`
+- **And** the read MUST return that outcome
+
+**42. Identity echo and correlation**
+- **Given** any intent carrying a `correlationId` and an opaque binding reference
+- **When** its confirmation or failure is published
+- **Then** it MUST echo the order reference, wave, idempotency key, `correlationId`, binding reference and asserting principal
+- **And** the `correlationId` MUST appear on the Policy Engine and OSS legs driven for that request
+
+**43. Uncontracted subscription runs on platform defaults**
+- **Given** a subscription with no contract binding, and later a contract signed for the same payer without a binding to this subscription
+- **When** renewal, notice and grace are evaluated
+- **Then** the platform defaults MUST govern, recorded with provenance `platform_default`
+- **And** the signed contract MUST NOT change this subscription's terms until an explicit binding is recorded
+
+**44. Usage attribution as of the consumption instant**
+- **Given** a resource reference provisioned under subscription A's add-on line, deprovisioned, and later provisioned again under subscription B's plan line
+- **When** Rating reads the attribution for a usage record stamped inside A's interval, and for one with an unknown resource reference
+- **Then** the first MUST resolve to subscription A and that add-on's `lineKey`
+- **And** the second MUST return an explicit no-match, never a guess
+
+**45. Trial without a payment method does not convert**
+- **Given** a trial whose target phase is paid and no payment method on file at trial end
+- **When** conversion runs
+- **Then** the phase boundary MUST NOT advance and no paid-phase entitlement MUST be issued; the trial MUST follow its expiry path
+- **And** with a valid method on file, a payment failure at conversion MUST enter the §6.5 grace ladder instead (AC 16)
 
 ## 13. Dependencies
 
 | Dependency | Description | Criticality |
 |------------|-------------|-------------|
 | AMS / OSS (tenant identity & hierarchy) | Tenant identity, `resourceTenantId` topology references, account/OrgTier context, delegation-proof backbone | `p1` |
-| Catalog registry (Product & SKU) | Published `skuId`, `PlanTier` taxonomy, `CatalogVersion`, `catalogSubscriptionProductKey` for the overlap rule; the **products** gear, `gears/bss/products/docs/PRD.md` (vendored 2026-07-16) | `p1` |
+| Catalog registry (Product & SKU) | Published `skuId`, `PlanTier` taxonomy, `CatalogVersion`, `catalogSubscriptionProductKey` for the overlap rule (not yet exposed — SUB-G1); the **products** gear, `gears/bss/products/docs/PRD.md` (vendored 2026-07-16) | `p1` |
 | Pricing (Product Catalog) | Published `planId`, `PriceWindow` linkage, price snapshot refs, trial offers ([pricing PRD](../../pricing/docs/PRD.md)) | `p1` |
 | Rating (evaluation core + pipeline) | Consumes composition read models + `(changeEffectiveAt, changeMode)`; owns proration math and usage slicing ([rating PRD](../../rating/docs/PRD.md)) | `p1` |
 | Billing & Invoicing | Ingests recurring `BillableItem`s; posts immutable invoices; adjustments/credit/debit notes; dunning execution | `p1` |
-| Contracts & Agreements | `Renewal` terms, grace ladder / regional templates, `PriceOverride` windows | `p1` |
+| Contracts & Agreements | The **contracts** gear (first draft): renewal terms and notice ladder, grace ladder / regional templates, ramps, `PriceOverride` windows, booking instant and acceptance declaration; optional per subscription — platform defaults govern where none is bound | `p1` |
+| Orders (Lifecycle + Workflow + Change Orders) | Caller of record for commercially initiated creates and increases: two-phase acquisition intents, compensation intents, change intents; consumer of the occupancy, composition and status reads ([orders-lifecycle](../../orders-lifecycle/docs/PRD.md), [orders-workflow](../../orders-workflow/docs/PRD.md), [orders-changes](../../orders-changes/docs/PRD.md)) | `p1` |
+| Usage Collector (via Rating) | Usage records without commercial identity; attribution resolved through this gear's read (§6.2 `fr-usage-attribution`) | `p1` |
 | Policy Engine | Fail-closed allow/deny + `reasonCodes` for resource-affecting transitions | `p1` |
 | OSS Provisioning | Provision/deprovision/pause execution confirmed by events | `p1` |
 | Payments (PSP) | Payment pre-check + retry-exhaustion signals for the grace ladder; authorization at renewal/trial conversion | `p2` |
@@ -1408,8 +1679,9 @@ Carried from the predecessor's module specifications, pending the same NFR-works
 ## 14. Assumptions
 
 - SLA numbers in §7.1 are working baselines from the predecessor PRD pending the program NFR workshop; the workshop overrides on conflict.
-- In this repository Plan&Price and Tariffs+Rating are the **pricing** and **rating** gears (originally vendored from upstream; upstream not maintained). The Product&SKU registry is **not yet authored in this repo** — a consumed dependency (§13; seam SUB-G1), referenced by name only.
-- Contracts will own grace-ladder / regional-template terms as §6.5 assumes; the current upstream Contracts PRD does not yet define them (tracked in §15/§16).
+- In this repository Plan&Price and Tariffs+Rating are the **pricing** and **rating** gears (originally vendored from upstream; upstream not maintained). The Product&SKU registry is the **products** gear (vendored 2026-07-16); it does not yet expose `catalogSubscriptionProductKey` (seam SUB-G1).
+- The **contracts** gear authors renewal, notice and grace terms and regional templates (`fr-renewal-terms`, `fr-grace-regional`) but is a first draft with no acceptance criteria; until it ships, every subscription runs on the platform defaults (§6.5), which this PRD treats as a first-class state.
+- The order path may ship after this gear. Until it is live in a deployment, `create` is called directly (§6.1 `fr-order-originated-create` item 9); the order-path contract is specified now because the cancel-reason set and the create dedup rule are breaking to change later.
 - Design closes trial attribute/event naming, overlap **dimension** binding, and Payments/Billing integration payloads (PSP webhooks, dunning handoff) consistent with the §6.5 grace ladder.
 - Trials remain representable without a `trial` status unless the BSS manifest enum is amended.
 - PostgreSQL is sufficient for subscription/entitlement state at launch; re-evaluate at the 100K+/tenant scale target (Design).
@@ -1421,17 +1693,25 @@ Carried from the predecessor's module specifications, pending the same NFR-works
 | **Question** | **Owner** | **Target Date** | **Answer** | **Date Answered** |
 |--------------|-----------|-----------------|------------|-------------------|
 | Is **`trial`** a `Subscription.status`? | Product / Architecture | — | **No** — trials use **attributes / `PlanLink` / contract+Catalog** on manifest statuses (§6.1). A manifest `trial` status would require manifest + Design change first. | 2026-05-12 |
-| Trial **commercial pattern** (trial-only SKU vs attribute-only vs hybrid) | Product / Catalog | — | **Resolved:** **Catalog-first** trial definition + **Contract** legal/commercial clauses + **Subscription** evaluated attributes (§6.1). Attribute-only allowed only with **Contract**-recorded terms. | 2026-05-12 |
-| Default cardinality: overlapping subscriptions allowed? | Product / Catalog | — | **Resolved:** default **one** `active` per **`(payerTenantId, catalogSubscriptionProductKey)`** unless Catalog/Contract sets **`maxConcurrentActive` > 1** or extra scope dimensions (§6.3). | 2026-05-12 |
+| Trial **commercial pattern** (trial-only SKU vs attribute-only vs hybrid) | Product / Catalog | — | **Resolved:** **Catalog-first** trial definition + optional **Contract** clauses + **Subscription** evaluated attributes (§6.1). **Amended 2026-09-29:** attribute-only trials are not permitted — no Contracts artifact authors trial clauses. | 2026-05-12 |
+| Default cardinality: overlapping subscriptions allowed? | Product / Catalog | — | **Resolved:** default **one** `active` per **`(payerTenantId, catalogSubscriptionProductKey)`** unless Catalog/Contract sets **`maxConcurrentActive` > 1** or extra scope dimensions (§6.3). The occupancy read returns the effective limit with provenance, the default included, so callers never assume one (2026-09-29). | 2026-05-12 |
+| Overlap-key dimension on the partner path: one payer buying the same product for several customer tenants collides on the default key `(payerTenantId, catalogSubscriptionProductKey)`. Does the default key gain `resourceTenantId`, or does the partner path rely on `maxConcurrentActive` > 1? | Architecture / Product (with Orders) | TBD | Raised by orders-lifecycle §15; Orders adopts the answer by reference and MUST NOT fork the key. | — |
+| Subscription composition granularity: one order line → one subscription is fixed here; a tenant with several enabled products as **one** subscription with a multi-product entitlement set is not expressible. Keep 1:1? | Architecture (with Orders) | TBD | Raised by orders-lifecycle §15; resolve here first, then reflect in Orders. | — |
+| Default auto-renewal and default term for an **uncontracted** subscription (§6.5 `fr-platform-defaults`) | Product | TBD | Notices, grace, dwell and cardinality defaults are set; these two are not. | — |
+| Binding a contract to a **live** subscription: does it change the in-flight term or only the next one? | Product (with Contracts) | TBD | Mirrors contracts §15; determines whether a binding is additive or behaviour-changing. | — |
+| Effect of `ContractTerminated` / contract expiry on a bound subscription: end-of-term cancel, or reversion to platform defaults? | Product (with Contracts) | Before the contracts gear publishes those events | §6.5 `fr-platform-defaults` item 4 requires the events to be consumed and recorded; the behaviour is open. | — |
+| Buyer-decided trial conversion and re-negotiated renewal: order-driven (price pin, approval, booking record) or direct? | Product (with Orders) | TBD | Raised by orders-lifecycle §15; automatic conversion and clockwork renewal stay direct. | — |
+| Change intent with items at **different future dates** (§6.3 `fr-composite-change` item 4): acceptance is one commit, but each dated item executes later under the full guard set (SUB-D-01) and can fail then — accept per-item execution, or require one effective date per change intent? | Product (with Orders) | TBD | Change Orders allows a date per line and requires all-or-nothing application; the two meet only if the dates coincide. | — |
 | Failed renewal **grace** (duration, recurring posture, Contract SoR, suspension triggers) | Product / Contracts | — | **Resolved in PRD** — §6.5 grace policy (7-day default, paused next-term recurring, Contract SoR + evaluated fields, hybrid exit trigger). | 2026-05-12 |
-| Legacy upstream PR #154 review items (canonical `refs`, HTTP header-name leakage, AC 7 "grace"-≠-status wording, proration ownership) | — | — | **Resolved / N/A.** All were addressed in this copy when the doc was brought here (canonical `refs`, header-name leakage §9.1, AC 7 wording, proration ownership §6.3); `gears-rust` is now canonical and upstream is not maintained, so there is no sync obligation. The one substantive item that remains a **live cross-PRD dependency** is Contracts not yet owning the grace/regional-template SoR — tracked as risk (§16, seam SUB-C1). | 2026-07-15 |
-| `convertTrial` / `updateQuantity` / the SUB-D-08 set (`renew`, `unschedule`, `pauseCollection`, `resumeCollection`, `confirmAcceptance`, `extendTrial`, `archive`) as `TransitionRequest.type` values + the scheduled-intent envelope (`cancelMode`, `resumeAt`) — manifest §4.3 alignment | Architecture / manifest owners | TBD | Proposed by §6.1 / §6.3 / §6.4 / §6.5 / §6.10 (this repo); needs manifest alignment like any type or envelope addition. | — |
+| Legacy upstream PR #154 review items (canonical `refs`, HTTP header-name leakage, AC 7 "grace"-≠-status wording, proration ownership) | — | — | **Resolved / N/A.** All were addressed in this copy when the doc was brought here (canonical `refs`, header-name leakage §9.1, AC 7 wording, proration ownership §6.3); `gears-rust` is now canonical and upstream is not maintained, so there is no sync obligation. The one substantive item that remained a **live cross-PRD dependency** — Contracts owning the grace/regional-template SoR — is now authored by the contracts gear (`fr-grace-regional`, first draft); its completion is tracked as risk (§16, seam SUB-C1). | 2026-07-15 |
+| `convertTrial` / `updateQuantity` / `changeComposition` / the SUB-D-08 set (`renew`, `unschedule`, `pauseCollection`, `resumeCollection`, `confirmAcceptance`, `extendTrial`, `archive`) as `TransitionRequest.type` values + the scheduled-intent envelope (`cancelMode`, `resumeAt`) + the order reference on `create` and the closed cancel-reason set incl. `order_compensation` — manifest §4.3 alignment | Architecture / manifest owners | TBD | Proposed by §6.1 / §6.3 / §6.4 / §6.5 / §6.10 (this repo); needs manifest alignment like any type or envelope addition. | — |
+| Direct `create` alongside the order path (manifest §4.6.1: "only a fulfilled Order spawns the Subscription") | Architecture / manifest owners | TBD | §6.1 `fr-order-originated-create` keeps the direct path for system, migration and operator creates and for pre-Orders deployments; the manifest note needs the same carve-out. | — |
 | Transfer billing boundary (immediate vs next-cycle payer rebind; mid-period payer split) | Product / Billing | TBD | SUB-D-06 pins the ordering key; the collection-side boundary of a payer rebind is a Billing/Product call (design slice 07 defaults to next-cycle). | — |
 | Brand overlay source discrepancy: rating PRD matches `brand` on Plan/SKU `brandId`, this PRD publishes the per-sale `brandId` (§6.2, AC 20) | Rating / Subscriptions | TBD | Pin with rating which source feeds step-4 brand matching (seam SUB-R5); AC 20 is not implementable while the two disagree. | — |
 | Draft retention TTL (auto-void of abandoned drafts) | Product | TBD | SUB-D-11 adds the `draft → cancelled` edge; **platform default 90 days since 2026-08-01** (SUB-D-11 amendment — the retention job submits the void; tenant-configurable, Product knob refines). | — |
 | Scheduled-intent firing grace horizon (retryable-class deadline: `effectiveAt` + horizon) | Product / Ops | TBD | Slice 01 §4.3 taxonomy cites this knob; row added 2026-08-01 (wave-3 review #5). Parked (state-precondition) firings suspend the horizon per SUB-D-23. | — |
 | Repeat-trial eligibility (serial re-trials after cancel) | Product / Pricing | TBD | No owner today; the overlap rule blocks only concurrent duplicates. Candidate: pricing trial-offer eligibility window or Contract clause. | — |
-| **Free paid-access vector (REVIEW F-06-1, revenue/abuse)** — the three open legs *compose* into an exploit loop: conversion with **no payment method on file** still issues full **paid-phase** entitlements (§6.10), the failure then enters the **7-day paid grace** ladder (§6.5), and serial re-trials are unbounded (row above). trial → convert with no method → 7 days full paid access → cancel → new trial → repeat | Product / Finance | Before trial GA | **Open — needs an anchor, and the choice is a Product call**: (a) limit serial re-trials at tenant/identity level; (b) no-method conversion grants **reduced** access for the grace window instead of full paid entitlements; (c) require a payment method before the conversion boundary advances. Deliberately not decided in design — each option trades conversion funnel against leakage. Note this gear already never trades access for collection, so the fix must come from one of the three legs, not from the grace ladder | — |
+| **Free paid-access vector (REVIEW F-06-1, revenue/abuse)** — the three open legs *compose* into an exploit loop: conversion with **no payment method on file** still issues full **paid-phase** entitlements (§6.10), the failure then enters the **7-day paid grace** ladder (§6.5), and serial re-trials are unbounded (row above). trial → convert with no method → 7 days full paid access → cancel → new trial → repeat | Product / Finance | Before trial GA | **Resolved: (c)** — a paid target phase requires a valid payment method before the conversion boundary advances; without one the trial follows its expiry path and no paid-phase entitlement is issued (§6.10 `fr-trial-conversion`, AC 45). This restores the predecessor's "no payment method → expire trial" behaviour lost in the 2026-07-15 consolidation. Options (a) limit serial re-trials and (b) reduced access during grace were not taken; serial re-trial eligibility stays open (row above). | 2026-09-29 |
 | Quota-crossing propagation bound (usage → check-state lag; overrun exposure) | OSS / Rating / Product | TBD | §6.9 fixes the check-state semantics; the end-to-end lag budget (rating pipeline + fold-in) has no NFR yet — hard limits are only as fast as that path. | — |
 | Entitlement check staleness budget default (SUB-D-10: last-known-good ≤ 60s on projection outage, then fail-closed — **feature-flag dimension only**) | Product / OSS | TBD | The degraded-mode shape is decided (SUB-D-10); the budget value is a Product/OSS knob to confirm. | — |
 | Quota freshness bound (SUB-D-10 amendment: the quota dimension of a check fails closed to `blocking` beyond it — never a last-known-good quota `allow`; provisional default **10s**) | Product / OSS | TBD | Ratify with the staleness budget before Design lock; slice 05 §4.3 owns the split. | — |
@@ -1453,9 +1733,9 @@ Carried from the predecessor's module specifications, pending the same NFR-works
 |------|--------|------------|
 | Suspension vs billing alignment left implicit (manifest risk note) | Revenue leak or double-charge during suspension | §6.4 requires the posture to be explicit product policy in subscription attributes + contract clauses |
 | Evergreen renewals / notice periods under-specified (manifest risk note) | Non-compliant auto-renewals; disputes | Contract templates MUST define notice/opt-out behavior (§6.5); Legal bounds on grace overrides; a pending price change at the renewal instant arms the 30-day **commercial** notice from the pricing lookahead inputs (SUB-D-17, AC 33 — mitigation completed 2026-08-01, wave-3 review #23) |
-| Contracts PRD does not yet define grace ladder / regional templates | §6.5 assumes a Contracts SoR that upstream has not authored yet | Track as upstream follow-up (§15); until then the 7-day platform default governs |
+| Contracts gear is a first draft (§1–§6, no acceptance criteria) | Renewal, notice and grace terms have no shipped owner; platform defaults harden into de-facto terms customers rely on | Platform defaults specified as a first-class state with provenance and an explicit-binding rule (§6.5 `fr-platform-defaults`); the in-flight-term migration rule is open (§15) |
+| Order-path seams unagreed (SEAMS §I: SUB-O1…O16, CHG-S1…S5) | Orders cannot guarantee atomic fulfillment, no-backdating or retry safety; the cancel-reason set is breaking to change once Billing consumes it | Adopted in §6.1 / §6.3 of this revision; the reason set and the create dedup rule are fixed now, before any consumer |
 | Proration ownership conflicts with older upstream Rating/Billing PRD wording | Ambiguous calculation authority ("Billing preview API") | §6.3 ownership split is normative here and matches the local rating gear; preview owner named in Design (§11 wording already neutral) |
-| Normative upstream reference to Rating (VHP-810) not yet merged — Product&SKU / Plan&Price / Tariffs landed in upstream `main` post-review | Broken traceability upstream for the one remaining link | Vendored rating gear covers it locally; the upstream unresolvable-links blocker on PR #154 narrows to rating-engine (§15) |
 | Dunning/PSP integration details deferred to Design | Grace ladder not executable end-to-end at launch | §6.5 fixes product defaults; Design encodes timers + Payments signals before implementation |
 | Entitlement check hot path (p95 < 100ms at 100K+/tenant) | Latency breach blocks real-time OSS enforcement | Cache-first check surface with the §7.1 propagation baseline; load test before GA |
 | Notifications integration missing at launch | Renewal notices / opt-out windows silently missed | §6.5 triggers are normative; Notifications delivery is a tracked `p2` dependency (§13) |
@@ -1470,7 +1750,10 @@ Carried from the predecessor's module specifications, pending the same NFR-works
 | Product & SKU Management (Catalog registry §4.1) | **products** gear — `gears/bss/products/docs/PRD.md` (vendored 2026-07-16 from PR #4177) | SoR for Product/SKU/Category/Attribute/`PlanTier`/`CatalogVersion` |
 | Plan & Price Modeling (Catalog §4.1) | [pricing PRD](../../pricing/docs/PRD.md) (vendored gear) | Owns `Plan`/`Price`/`PriceWindow` linkage that `PlanLink` resolves |
 | Rating (§4.2 — incl. the evaluation core, former "Tariffs") | [rating PRD](../../rating/docs/PRD.md) (vendored gear, consolidated per rating ADR-0002) | Owns proration math, override hierarchy, coupons, FX; consumes `(changeEffectiveAt, changeMode)`; shared ordering key |
-| Contracts and Agreements (§4.6) | `docs/bss/prd/PRD-contracts-agreements-202601120119/` (upstream) | SoR for renewal terms; grace ladder / regional templates are a tracked follow-up (§16) |
+| Contracts and Agreements (§4.6) | **contracts** gear — [`gears/bss/contracts/docs/PRD.md`](../../contracts/docs/PRD.md) (first draft; the upstream `PRD-contracts-agreements-202601120119` is legacy provenance) | SoR for renewal terms, notice and grace ladders, regional templates, ramps, booking/acceptance |
+| Orders Lifecycle | [`gears/bss/orders-lifecycle/docs/PRD.md`](../../orders-lifecycle/docs/PRD.md) | Order document and state SoR; two-phase atomic fulfillment; boundary rules R1–R5 |
+| Orders Workflow | [`gears/bss/orders-workflow/docs/PRD.md`](../../orders-workflow/docs/PRD.md) | Caller of record for order-path intents; retry, sweep and compensation protocol |
+| Change Orders | [`gears/bss/orders-changes/docs/PRD.md`](../../orders-changes/docs/PRD.md) | Change intent contract and asks CHG-S1…S5 |
 | Billing — Ledger & Balances (§4.4) | **ledger** gear — [`gears/bss/ledger/docs/PRD.md`](../../ledger/docs/PRD.md) (vendored; the `docs/bss/prd/PRD-billing-ledger-balances-202604041200/` path is historical, not vendored here) | Posted-invoice immutability, adjustments, rounding authority |
 | Billing module (§4.4) | `docs/bss/prd/PRD-billing-module-202601120119/` (upstream) | Recurring ingestion, dunning execution |
 
