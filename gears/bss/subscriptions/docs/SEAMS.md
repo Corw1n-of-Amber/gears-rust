@@ -105,13 +105,14 @@
 ## E. Policy Engine & OSS Provisioning
 
 > Every resource-affecting transition is fail-closed gated by Policy before commit; OSS executes
-> provisioning; entitlement **enforcement** executes in OSS while the **decision state** stays here.
+> provisioning; entitlement **issuance** is requested from License Manager, **checks** are the platform `license-enforcement`
+> gear's and **counting** is `quota-enforcement`'s; only the **posture decision** stays here (re-split 2026-10-02, section J).
 
 | # | Sev | Verdict | Seam |
 |---|-----|---------|------|
 | **SUB-E1** | CRIT | **ALIGNED (SUB-adopts)** | **Fail-closed Policy gate.** Every resource-affecting transition passes a pre-commit allow/deny + `reasonCodes`; on deny **or unavailability** the state MUST NOT change (S:450, S:1046; AC 1). Manifest §6. Aligned; design maps the gate call + reason surfacing. |
 | **SUB-E2** | HIGH | **SUB-authors** | **OSS provisioning confirmation.** `activate`/`suspend`/`resume`/`cancel` coordinate provision/deprovision/pause **work orders confirmed by events**; **BSS never mutates OSS resource topology directly** (S:272, S:1052). Subscriptions issues the intent + consumes the confirmation; it does not touch OSS state. |
-| **SUB-E3** | HIGH | **Joint** | **Entitlement enforcement split.** Subscriptions serves the **point-of-use check decision state** (feature flag, quota remaining, limit state) at **p95 < 100ms** (S:877); **OSS enforces** (allow/block/degrade) — this gear never executes enforcement. **Open (§15):** mid-request behaviour at the exhaustion instant (graceful degradation vs hard block) is OSS/Design (S:887, S:1344). Pin the check-state ↔ enforcement contract with OSS at design. |
+| **SUB-E3** | HIGH | **CLOSED by re-split (2026-10-02)** | **Entitlement enforcement split.** Formerly: Subscriptions serves the point-of-use check decision state at p95 < 100 ms and OSS enforces. Now: Subscriptions decides the posture and submits an idempotent issuance request (SUB-L1); **License Manager** materializes licenses, packs and limits; **license-enforcement** answers `license-resolver` checks; **quota-enforcement** counts and applies soft/hard limits, including the mid-request exhaustion instant. No check surface, counter or staleness budget remains in this gear (SUB-D-10 withdrawn, SUB-D-30). |
 | **SUB-E4** | CRIT | **Neighbour-extends (OSS)** | **Resource and data disposition (added 2026-10-01).** In OSS a deprovision deletes the resource (`rms.resource.deleted`). The PRD now requires: pause without deletion on suspend for data-bearing resources; a retention hold with read-only export for the data retention window after any cancel; deletion at the window's end confirmed by event; deletion stopped while a legal hold applies ([`PRD.md`](./PRD.md) §6.11 `fr-resource-disposition`, AC 46–47). OSS must expose pause, retention hold, export and confirmed purge per resource class. Supersedes the "deprovisioning suspend" case in slice 01 §3.6. |
 | **SUB-E5** | HIGH | **Neighbour-extends (OSS)** | **Resource adoption on import (added 2026-10-01).** Importing a live legacy subscription adopts its running resources: OSS validates the listed references against its inventory and the usage attribution binding opens from the import instant, with no provisioning work order ([`PRD.md`](./PRD.md) §6.1 `fr-import`, AC 52). |
 
@@ -182,6 +183,20 @@
 
 ---
 
+## J. License Manager (issuance seam, added 2026-10-02)
+
+> Upstream PRD `PRD-license-manager-202610021000` (vhp-architecture, branch VHP-267): the commercial system of record
+> for licenses and the issuer for both planes — packs into `license-enforcement` and limits into `quota-enforcement`
+> for platform scopes, signed artifacts for installed products. Subscriptions is its caller of record for commercial
+> issuance.
+
+| # | Sev | Verdict | Seam |
+|---|-----|---------|------|
+| **SUB-L1** | CRIT | **Joint** | **Issuance request.** On every committed resource-affecting transition Subscriptions submits `issue` / `renew` / `replace` / `suspend` / `reinstate` / `revoke` / `convert` with the resolved posture (grant set, quantity, validity, tenants, phase, order reference) and a commercial event token derived from `(subscriptionId, revision, transition)`; License Manager is idempotent on it and refuses outside eligibility or bounds before creating anything ([`PRD.md`](./PRD.md) §6.9 `fr-entitlement-issue-revoke`, §9.2 `contract-license-manager`; License Manager PRD §6.2, §6.7, §9.2 `contract-license-subscriptions`). Wording mirrored in both PRDs. |
+| **SUB-L2** | HIGH | **Neighbour-provides** | **License state and findings back.** License Manager publishes per subscription line the state of the licenses and packs that back it and the findings that matter commercially (usage gap, concurrent use, issuance pending); Subscriptions shows them on its read model and treats an issuance pending beyond the hand-off budget as an exception, never as an activated entitlement ([`PRD.md`](./PRD.md) §6.9 `fr-entitlement-license-state`, §7.1 `nfr-entitlement-handoff`). |
+| **SUB-L3** | HIGH | **SUB-adopts** | **Trials, suspension and conversion map to License Manager verbs.** Trial provisioning = `issue` of a trial-type license; end-of-trial and early conversion = `replace` with binding carry-over (no re-activation of an installed product); suspend/resume on the grace ladder = `suspend` / `reinstate`; cancel = `revoke` ([`PRD.md`](./PRD.md) §6.10, §6.4, §6.5). |
+| **SUB-L4** | MED | **Neighbour-extends (platform)** | **`license-enforcement` actor naming.** The platform `license-enforcement` PRD names Subscriptions as the actor that issues packs; with SUB-L1 that actor is License Manager. Alignment follows when the License Manager PRD is contributed to this repository; nothing is requested from the platform owners before that. |
+
 ## Ownership matrix (contested / adjacent responsibilities)
 
 | Responsibility | Owner | Seam |
@@ -200,7 +215,8 @@
 | Plan-change **classification** (comparability/targets) | **Pricing** (publishes); Subscriptions enforces | SUB-P1 |
 | Entitlement grant-set **templates** (incl. per-phase) | **Pricing** (authors); Subscriptions assigns | SUB-P2 |
 | Entitlement **assignment** per subscription | **Subscriptions** | SUB-P2 |
-| Entitlement point-of-use **decision state** | **Subscriptions** (serves); OSS enforces | SUB-E3 |
+| Entitlement **materialization** (licenses, packs, limits) | **License Manager** (on this gear's request) | SUB-L1 |
+| Entitlement point-of-use **check** / quota **counting** | **license-enforcement** / **quota-enforcement** (platform); not here | SUB-E3 |
 | Trial sellable **definition** | **Pricing/Catalog**; Contract legal clauses | SUB-P3, SUB-C1 |
 | Prepaid credit **definition** / **drawdown** | **Pricing** (D-43 def) / **Billing+Rating** (balance) | SUB-P4, SUB-B4 |
 | Renewal / grace / regional templates SoR | **Contracts** (unauthored upstream → platform default) | SUB-C1 |
@@ -235,7 +251,7 @@
 - **SUB-D-07** — recurring split: money-free period fact here, rating prices, Billing posts. Seams SUB-R6, SUB-B1.
 - **SUB-D-08** — mutation-type inventory completed (`renew`, `unschedule`, `pauseCollection`/`resumeCollection`, `confirmAcceptance`, `extendTrial`). Seam SUB-N1.
 - **SUB-D-09** — secondary producer-event inventory named in design slice 08. Seams SUB-R1, SUB-B1.
-- **SUB-D-10** — entitlement check surface: bounded-staleness degraded mode. Seam SUB-E3.
+- **SUB-D-10** — withdrawn 2026-10-02: no entitlement check surface in this gear (SUB-E3 closed by re-split; see SUB-D-30).
 - **SUB-D-11** — `draft → cancelled` (void) edge. (Status machine; no cross-gear seam.)
 - **SUB-D-12** — `collectionPaused` defers renewal collection (pre-check/grace/dunning), not term extension. Seam SUB-B2.
 - **SUB-D-13** (2026-07-28) — term boundaries always resolve: `autoRenew=false` → system `term_expired` cancel; post-suspension payment backdates the term. Seams SUB-C1, SUB-B1.
@@ -253,6 +269,7 @@
 - **SUB-D-25** (2026-08-01, wave-3) — ETF derivation reason-aware (`customer`/`operator` only) + the term/period join key on `SubscriptionCancelled`. Seam **SUB-B7**.
 - **SUB-D-26** (2026-08-01, wave-3) — the grandfathered cohort does not carry across cancel+new; loss disclosed pre-execution. Seams SUB-P6, SUB-P1.
 - **SUB-D-27** (2026-08-01, SB1-resolution round) — `billingAnchorPolicy` adopted verbatim (K2 enum + D-20 no-drift clamp), executed by the emitter's period derivation; an anchor-altering plan change takes effect at the next boundary; K5 joint anchor fixture = design-freeze gate. Seams **SUB-P9**, SUB-B1.
+- **SUB-D-30** — entitlement seam re-split (2026-10-02): posture decision here; issuance of licenses, packs and limits by **License Manager** on an idempotent commercial-event request; checks by `license-enforcement`; counting by `quota-enforcement`. Numbers 28–29 are held by the pricing owner's branch. Seams SUB-E3, SUB-L1…L4.
 
 **Aligned (counterpart written; no action beyond citing):**
 - SUB-R2 (rating SEAMS S1), SUB-E1. *(SUB-P3 and SUB-B1 were removed from this list 2026-08-01 — wave-3 review #21: SUB-P3's own verdict is OPEN since 2026-07-28, and SUB-B1 is the rating-SB1 CRIT joint seam.)*
@@ -271,7 +288,7 @@
 - **SUB-R5** — brand context source for overlay matching (per-sale vs Plan/SKU) — pin with rating; AC 20 blocked until resolved.
 - **SUB-R6** — recurring pricing enrichment (SUB-D-07): rating counterpart contract + joint fixture (fixture scope now includes the SUB-D-21 `lineKey` value rule).
 - **SUB-B6** — Billing to expose the `billedThroughAt` posted-period watermark for the backdating guard.
-- **SUB-E3** — check-state ↔ OSS enforcement contract + quota mid-request instant — pin with OSS; staleness-budget default (SUB-D-10) to confirm.
+- **SUB-L1** — issuance request contract with License Manager (token derivation, refusal handling, state and findings read) — pin against License Manager PRD §9.2 at design; SUB-E3 closed by SUB-D-30.
 - **SUB-B2 / SUB-B4** — pause-day limits + resume proration (Product/Billing); prepaid drawdown/tax placement (pricing G-4) — pin with Billing.
 - **SUB-C2** — atomic multi-action ramp submission — Contracts/Design follow-up.
 - **SUB-C4** — acceptance-confirmation flow shape — Design.
