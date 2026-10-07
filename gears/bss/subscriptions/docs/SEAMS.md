@@ -270,7 +270,7 @@
 - **SUB-D-25** (2026-08-01, wave-3) — ETF derivation reason-aware (`customer`/`operator` only) + the term/period join key on `SubscriptionCancelled`. Seam **SUB-B7**.
 - **SUB-D-26** (2026-08-01, wave-3) — the grandfathered cohort does not carry across cancel+new; loss disclosed pre-execution. Seams SUB-P6, SUB-P1.
 - **SUB-D-27** (2026-08-01, SB1-resolution round) — `billingAnchorPolicy` adopted verbatim (K2 enum + D-20 no-drift clamp), executed by the emitter's period derivation; an anchor-altering plan change takes effect at the next boundary; K5 joint anchor fixture = design-freeze gate. Seams **SUB-P9**, SUB-B1.
-- **SUB-D-30** — entitlement seam re-split (2026-10-02): posture decision here; issuance of licenses, packs and limits by **License Manager** on an idempotent commercial-event request; checks by `license-enforcement`; counting by `quota-enforcement`. Numbers 28–29 are held by the pricing owner's branch. Seams SUB-E3, SUB-L1…L4.
+- **SUB-D-30** — entitlement seam re-split (2026-10-02): posture decision here; issuance of licenses, packs and limits by **License Manager** on an idempotent commercial-event request; checks by `license-enforcement`; counting by `quota-enforcement`. Numbers 28–29 are the PriceBook decisions ([`DECISIONS.md`](./DECISIONS.md)). Seams SUB-E3, SUB-L1…L4.
 
 **Aligned (counterpart written; no action beyond citing):**
 - SUB-R2 (rating SEAMS S1), SUB-E1. *(SUB-P3 and SUB-B1 were removed from this list 2026-08-01 — wave-3 review #21: SUB-P3's own verdict is OPEN since 2026-07-28, and SUB-B1 is the rating-SB1 CRIT joint seam.)*
