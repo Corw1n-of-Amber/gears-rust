@@ -8,7 +8,7 @@
 > and the subscription lifecycle PRD ([`PRD.md`](./PRD.md)). Subscriptions is the **System of
 > Record** for the subscription commercial aggregate: the lifecycle state machine, effective-dated
 > composition (`PlanLink`/`AddOn`), the change **boundary/mode**, renewal execution, entitlement
-> assignment + point-of-use check state, and multi-tenant ownership. It is **not** an authoring
+> assignment and posture (License Manager issues, `license-enforcement` checks; SUB-E3), and multi-tenant ownership. It is **not** an authoring
 > catalog and it computes **no** money — pricing owns the catalog, rating owns evaluation and
 > proration math, Billing owns posting.
 >

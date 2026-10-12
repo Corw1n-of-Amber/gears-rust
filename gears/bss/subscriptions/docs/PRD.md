@@ -13,7 +13,7 @@ refs:
 ---
 
 Created:  2026-08-24 by Virtuozzo International GmbH
-Updated:  2026-10-02 by Virtuozzo International GmbH
+Updated:  2026-10-12 by Virtuozzo International GmbH
 
 # PRD — Subscriptions — End-to-End Lifecycle (Multi-Tenant Revenue Object)
 
@@ -69,6 +69,7 @@ Updated:  2026-10-02 by Virtuozzo International GmbH
   - [Ordering pin, recurring split, void, pause interplay](#ordering-pin-recurring-split-void-pause-interplay)
   - [Orders, contracts, and usage attribution](#orders-contracts-and-usage-attribution)
   - [Data, terms, co-termination, and import](#data-terms-co-termination-and-import)
+  - [Service readiness](#service-readiness)
 - [13. Dependencies](#13-dependencies)
 - [14. Assumptions](#14-assumptions)
 - [15. Open Questions](#15-open-questions)
@@ -416,6 +417,7 @@ Client ─▶ API GW ─▶ Subscriptions: validate + TransitionRequest
 | Plan change (upgrade/downgrade) with proration policy hooks | `p1` | Triggers Billing alignment; no posted-invoice mutation (§6.3) |
 | Suspension & reactivation (Policy + OSS paths) | `p1` | Entitlement revoke/restore per §4.3 (§6.4, §6.9) |
 | Entitlement posture and the issuance request to License Manager on subscription transitions | `p1` | Driven by activate/suspend/resume/cancel, renewal, phase boundaries and composition-changing transitions; materialization, checks and counting are the platform licensing gears' (§6.9, §2.2) |
+| Service readiness (pending / ready / partial / failed) separate from commercial status, on the read model and the intent confirmations | `p1` | §6.9 `fr-service-readiness` |
 | Renewal (auto/manual) with Contract linkage | `p1` | Consumes `ContractRenewed` / renewal terms where applicable (§6.5) |
 | Event model (manifest producers + correlation) | `p1` | CloudEvents 1.0; ordering invariant (§6.7) |
 | Recurring `BillableItem` emission to Billing | `p1` | Idempotent `(subscriptionId, billing period, lineKey)` — per component, SUB-D-19 (§6.8) |
@@ -506,7 +508,7 @@ Manifest `Subscription.status` is **`draft` | `active` | `suspended` | `cancelle
 
 | **From** | **To** | **Trigger (verb)** | **Guard (summary)** |
 |----------|--------|--------------------|----------------------|
-| draft | active | activate | Policy allow + OSS provision confirm + entitlements issued (manifest §4.3); target resolves to a **published** plan passing the adopted pricing sellability gate — incl. the D-80 coverage horizon and the D-94 **full conjunction over every scope key the purchase binds** on the bound `(currency, region)`, one failing key blocks the sale (SEAMS SUB-P5; carried into this PRD 2026-08-01, wave-3 review #17; same gate on `create`/`changePlan`) |
+| draft | active | activate | Policy allow + OSS provision confirm for every resource of the subscription (manifest §4.3); the license issuance request is submitted on commit, and its outcome is service readiness, not a guard (§6.9 `fr-service-readiness`; the manifest's "entitlements issued" guard predates the License Manager split); target resolves to a **published** plan passing the adopted pricing sellability gate — incl. the D-80 coverage horizon and the D-94 **full conjunction over every scope key the purchase binds** on the bound `(currency, region)`, one failing key blocks the sale (SEAMS SUB-P5; carried into this PRD 2026-08-01, wave-3 review #17; same gate on `create`/`changePlan`) |
 | draft | cancelled | cancel (void) | Not resource-affecting (nothing provisioned); `cancelMode = immediate` only; audited (SUB-D-11) |
 | active | suspended | suspend | Policy + coordinate the OSS pause; data-bearing resources are never deleted on suspend (§6.11) |
 | suspended | active | resume | Policy allow; where the suspension was grace-driven, the blocking payment failure MUST be resolved first (§6.5) |
@@ -980,7 +982,7 @@ Commercial roll-ups follow **account** and **OrgTier** context from AMS; Subscri
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-fr-event-producers`
 
-Subscriptions **MUST emit** (CloudEvents 1.0, tenant-scoped, minimal PII): `SubscriptionCreated`, `SubscriptionActivated`, `SubscriptionSuspended`, `SubscriptionResumed`, `SubscriptionCancelled`, **`SubscriptionPlanChanged`**, `BillableItemCreated` (`kind ∈ {recurring, one_time}` — the one-time lane per SUB-D-24, 2026-08-01), `EntitlementPostureChanged` (the manifest's `EntitlementIssued` / `EntitlementRevoked` are produced by License Manager on materialization — alignment tracked in §15), `OwnershipTransferRequested`, `OwnershipTransferApproved`, `OwnershipTransferCompleted` (transfer per manifest §4.11). This is the manifest **baseline**; the **secondary auditable events** this PRD mandates elsewhere — intent scheduling/un-scheduling (AC 22), renewal outcome and grace entry/exit (AC 7), notice triggers (AC 19), the collection-pause window (AC 24), the quantity composition event (AC 23), the trial conversion/extension events (AC 16–17), acceptance confirmation (AC 25), quota warning/exhaustion/restore (AC 14), and the **seat bind/release pair `SeatBound`/`SeatReleased`** (§6.9 seat bindings; added 2026-08-01, wave-3 review #24g) — extend this inventory with naming closed normatively in **Design slice 08** (SUB-D-09).
+Subscriptions **MUST emit** (CloudEvents 1.0, tenant-scoped, minimal PII): `SubscriptionCreated`, `SubscriptionActivated`, `SubscriptionSuspended`, `SubscriptionResumed`, `SubscriptionCancelled`, **`SubscriptionPlanChanged`**, `BillableItemCreated` (`kind ∈ {recurring, one_time}` — the one-time lane per SUB-D-24, 2026-08-01), `EntitlementPostureChanged` (the manifest's `EntitlementIssued` / `EntitlementRevoked` are produced by License Manager on materialization — alignment tracked in §15), `OwnershipTransferRequested`, `OwnershipTransferApproved`, `OwnershipTransferCompleted` (transfer per manifest §4.11). This is the manifest **baseline**; the **secondary auditable events** this PRD mandates elsewhere — intent scheduling/un-scheduling (AC 22), renewal outcome and grace entry/exit (AC 7), notice triggers (AC 19), the collection-pause window (AC 24), the quantity composition event (AC 23), the trial conversion/extension events (AC 16–17), acceptance confirmation (AC 25), quota warning/exhaustion/restore (AC 14), and the **seat bind/release pair `SeatBound`/`SeatReleased`** (§6.9 seat bindings; added 2026-08-01, wave-3 review #24g), and the readiness change `SubscriptionReadinessChanged` (§6.9 `fr-service-readiness`, AC 53) — extend this inventory with naming closed normatively in **Design slice 08** (SUB-D-09).
 
 **Rationale**: The manifest §4.3 producer inventory is the downstream integration surface.
 
@@ -1091,6 +1093,23 @@ Subscriptions MUST consume, per subscription line, the state License Manager rep
 **Rationale**: Operators and partners read the subscription first; the licensing facts behind it must be visible there without making License Manager a second lifecycle authority.
 
 **Actors**: `cpt-cf-bss-subscriptions-actor-license-manager`, `cpt-cf-bss-subscriptions-actor-partner-admin`, `cpt-cf-bss-subscriptions-actor-platform-operator`
+
+#### Service readiness separate from commercial status
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-fr-service-readiness`
+
+The subscription status records what was **commercially accepted**; it MUST NOT be read as "ready to use". Every subscription MUST also carry a **service readiness** state, derived from the outcomes this gear tracks for its current composition: the OSS work orders for its resources and the state License Manager reports for its licenses, packs and limits (`fr-entitlement-license-state`).
+
+- `pending`: at least one outcome is outstanding within its budget, and none has failed.
+- `ready`: every resource is confirmed and every license, pack and limit is issued.
+- `partial`: at least one component is ready, and at least one has failed or is pending beyond its budget.
+- `failed`: no component is ready, and at least one has failed or is pending beyond its budget.
+
+Readiness MUST be on the subscription read model and on every confirmation and status read of the caller intent protocol (`fr-intent-protocol`), so that an order-path caller reports acceptance and readiness separately to its own upstream (a CRM deal, a distributor purchase order). A readiness change MUST be published as `SubscriptionReadinessChanged` (§6.7). Readiness never drives a lifecycle transition on its own: `partial` and `failed` are auditable exceptions routed to an operator, and any remedy (retry, compensating cancel, credit) is an explicit transition or a Billing artifact. At activation the OSS outcome is a guard (§4.3 transitions): an activation whose resources OSS confirms only in part fails, and the resources already confirmed for it are deprovisioned with audit, so a subscription never becomes `active` with resources missing. `partial` therefore arises from license issuance and from later changes (add-ons, quantity, plan change, resume).
+
+**Rationale**: An order is accepted before the service works. A partner channel needs both facts; reading `active` as "ready" reports a service the customer cannot use yet.
+
+**Actors**: `cpt-cf-bss-subscriptions-actor-orders`, `cpt-cf-bss-subscriptions-actor-license-manager`, `cpt-cf-bss-subscriptions-actor-oss-provisioning`, `cpt-cf-bss-subscriptions-actor-platform-operator`
 
 ### 6.10 Trial Runtime and Conversion
 
@@ -1801,6 +1820,15 @@ For the intents of §6.1 `fr-intent-protocol`, this gear MUST publish a p95 and 
 - **And** no one-time or setup fact MUST be emitted, and the first recurring fact MUST start at the billed-through instant
 - **And** importing the same legacy identifier again MUST return the existing subscription
 
+### Service readiness
+
+**53. Accepted is not ready**
+- **Given** an order-originated activation whose resources OSS confirms and whose license License Manager has not yet issued
+- **When** the activation commits and the caller reads the request status
+- **Then** the subscription MUST be `active` with readiness `pending`, and the confirmation MUST carry both
+- **And** when License Manager then refuses the issuance, readiness MUST become `failed`, `SubscriptionReadinessChanged` MUST be published, an operator exception MUST exist, and the status MUST stay `active`
+- **And** an activation for which OSS confirms only part of the resources MUST fail, and the confirmed resources MUST be deprovisioned with audit
+
 ## 13. Dependencies
 
 | Dependency | Description | Criticality |
@@ -1839,14 +1867,14 @@ For the intents of §6.1 `fr-intent-protocol`, this gear MUST publish a p95 and 
 | Is **`trial`** a `Subscription.status`? | Product / Architecture | — | **No** — trials use **attributes / `PlanLink` / contract+Catalog** on manifest statuses (§6.1). A manifest `trial` status would require manifest + Design change first. | 2026-05-12 |
 | Trial **commercial pattern** (trial-only SKU vs attribute-only vs hybrid) | Product / Catalog | — | **Resolved:** **Catalog-first** trial definition + optional **Contract** clauses + **Subscription** evaluated attributes (§6.1). **Amended 2026-09-29:** attribute-only trials are not permitted — no Contracts artifact authors trial clauses. | 2026-05-12 |
 | Default cardinality: overlapping subscriptions allowed? | Product / Catalog | — | **Resolved:** default **one** `active` per **`(payerTenantId, catalogSubscriptionProductKey)`** unless Catalog/Contract sets **`maxConcurrentActive` > 1** or extra scope dimensions (§6.3). The occupancy read returns the effective limit with provenance, the default included, so callers never assume one (2026-09-29). | 2026-05-12 |
-| Overlap-key dimension on the partner path: one payer buying the same product for several customer tenants collides on the default key `(payerTenantId, catalogSubscriptionProductKey)`. Does the default key gain `resourceTenantId`, or does the partner path rely on `maxConcurrentActive` > 1? | Architecture / Product (with Orders) | TBD | Raised by orders-lifecycle §15; Orders adopts the answer by reference and MUST NOT fork the key. | — |
+| Overlap-key dimension on the partner path: one payer buying the same product for several customer tenants collides on the default key `(payerTenantId, catalogSubscriptionProductKey)`. Does the default key gain `resourceTenantId`, or does the partner path rely on `maxConcurrentActive` > 1? | Architecture / Product (with Orders) | TBD | Raised by orders-lifecycle §15; Orders adopts the answer by reference and MUST NOT fork the key. **Product direction (2026-10-12):** the default key gains `resourceTenantId`, `(payerTenantId, resourceTenantId, catalogSubscriptionProductKey)`, so a distributor or reseller buying one product for several customers holds one active subscription per customer. `maxConcurrentActive` > 1 is not used for this, as it would also admit a duplicate for the same customer. §6.3 changes once Architecture and Orders confirm. | — |
 | Subscription composition granularity: one order line → one subscription is fixed here; a tenant with several enabled products as **one** subscription with a multi-product entitlement set is not expressible. Keep 1:1? | Architecture (with Orders) | TBD | Raised by orders-lifecycle §15; resolve here first, then reflect in Orders. | — |
 | Default auto-renewal and default term for an **uncontracted** subscription (§6.5 `fr-platform-defaults`) | Product | — | **Resolved:** evergreen with auto-renewal on; the order line's term overrides the default (§6.5 `fr-term-source`). | 2026-10-01 |
 | **Two-tier (wholesale/retail) billing** for resellers: how one subscription or usage stream yields a platform→reseller wholesale charge and a reseller→customer retail charge, and which payer rule wins — the order-supplied `payerTenantId` here or the ledger's "nearest `self_managed` ancestor-or-self" (ledger design/01a) | Product + Architecture (with Ledger; a partner-settlement PRD to be authored) | TBD | Not specified anywhere; the ledger defers inter-tenant settlement to a PRD that does not exist. | — |
-| **External billing mode**: a provider keeps its own billing system (e.g. WHMCS, HostBill) as the source of truth while this gear holds entitlements and usage; outbound webhooks / partner event API (signing, retry, replay, versioning) and inbound sync with identifier mapping | Product + Architecture (with event-broker) | TBD | Manifest §6 allows an external system "acting as the authoritative source"; no gear specifies the mode or webhooks. | — |
+| **External billing mode**: a provider keeps its own billing system (e.g. WHMCS, HostBill) as the source of truth while this gear holds entitlements and usage; outbound webhooks / partner event API (signing, retry, replay, versioning) and inbound sync with identifier mapping | Product + Architecture (with event-broker) | TBD | Manifest §6 allows an external system "acting as the authoritative source"; no gear specifies the mode or webhooks. **Product direction (2026-10-12):** a subscription carries `billingAuthority` (`platform` or `external`). With `external` it keeps the external order and finance references, and no billable fact for it reaches platform Billing, so one sale is never billed twice; the accepted external order is the evidence that allows activation, conversion and renewal. | — |
 | **Account Management linkage**: tenant delete precondition "no non-terminal subscriptions" for payer and resource tenants; effect of tenant and partner suspension on subscriptions; implementation of the manifest offboarding order | Architecture (Account Management + Subscriptions) | TBD | Account Management today checks only Resource Group associations before deleting a tenant. | — |
 | **Dunning outside renewal**: path to grace or suspension for an unpaid recurring invoice of an evergreen subscription and for an unpaid in-arrears usage invoice; who executes dunning | Billing (no gear yet) + Product | TBD | The §6.5 ladder triggers only on renewal. | — |
-| **Payment method binding**: per account or per subscription; meaning of "valid"; pay-by-invoice customers and resellers versus the auto-renewal pre-check | Payments (no gear yet) + Product | TBD | — | — |
+| **Payment method binding**: per account or per subscription; meaning of "valid"; pay-by-invoice customers and resellers versus the auto-renewal pre-check | Payments (no gear yet) + Product | TBD | **Product direction (2026-10-12):** the "valid payment method on file" condition (§6.5 auto-renewal, §6.10 paid conversion) becomes a **payment arrangement** of one of three kinds: a payment method on file; approved invoice terms, where the approval of the order or of the account's credit terms is the evidence (resellers on post-payment qualify); or external billing (row above). What each kind requires and where it is held stays with Payments. | — |
 | **Money on cancellation for uncontracted subscriptions**: early-termination fee, unused-portion refund or credit, credit application; pricing D-49 ("no credits at launch") | Product + Billing | TBD | Contracts authors no fee or refund terms; the platform defaults define none. | — |
 | **Consumer protection**: cooling-off / withdrawal right, reminder before a trial converts to paid, cancellation accepted even while the Policy Engine is unavailable, consumer-vs-business flag | Product + Legal | TBD | — | — |
 | **Availability and recovery NFRs**: availability SLO (manifest: Catalog/Subscriptions 99.5%), RPO/RTO (manifest: RPO ≤ 5 min, RTO ≤ 60 min per region), backup and tenant-scoped restore, completion windows for renewal, notice and retention jobs | Architecture (NFR workshop) | TBD | Manifest values exist; this PRD does not adopt them yet. | — |
