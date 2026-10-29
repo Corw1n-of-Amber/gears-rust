@@ -148,7 +148,7 @@
 > Rows SUB-O1…O6 cite the Orders Lifecycle findings register as `REVIEW F-n`.
 >
 > **Updated 2026-09-29.** The three Orders gears are now in this repository —
-> [`orders-lifecycle`](../../orders-lifecycle/docs/PRD.md), [`orders-workflow`](../../orders-workflow/docs/PRD.md)
+> [`orders`](../../orders/docs/PRD.md) (formerly `orders-lifecycle`), [`orders-workflow`](../../orders-workflow/docs/PRD.md)
 > and [`orders-changes`](../../orders-changes/docs/PRD.md) — and their design sets register further
 > asks on this gear in their `UPSTREAM_REQS`: `SUB-O10`…`SUB-O16` (Lifecycle and Workflow) and
 > `CHG-S1`…`CHG-S5` (Change Orders, deliberately in its own namespace). Numbers `SUB-O7`…`SUB-O9` are
