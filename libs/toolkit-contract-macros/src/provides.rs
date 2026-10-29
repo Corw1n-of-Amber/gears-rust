@@ -26,22 +26,38 @@ use crate::support::{append_segment, parent_module};
 
 /// Parsed `#[toolkit::provides(...)]` attribute.
 pub struct ProvidesAttr {
+    /// Path of the contract trait being provided.
     pub contract: Path,
-    pub local: Path,
+    /// In-process factory. Required when `transports` includes `local`; a
+    /// provider served only remotely (its in-process access goes through
+    /// another seam) omits it.
+    pub local: Option<Path>,
+    /// Transports the contract is exposed over; defaults to local only.
     pub transports: Vec<Transport>,
+    /// Optional override for the generated REST client type path.
     pub rest_client: Option<Path>,
+    /// Optional override for the generated gRPC client type path.
     pub grpc_client: Option<Path>,
+    /// Optional override for the path of the function returning the contract IR.
     pub ir_fn: Option<Path>,
+    /// Optional override for the path of the REST binding function.
     pub rest_binding_fn: Option<Path>,
+    /// Optional override for the path of the gRPC binding function.
     pub grpc_binding_fn: Option<Path>,
+    /// Optional config key under which the provider's transport settings are read.
     pub config_key: Option<String>,
+    /// Optional list of policy expressions applied to the provided contract.
     pub policies: Option<Vec<Expr>>,
 }
 
+/// Transport over which a provided contract can be reached.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
+    /// In-process call through the local factory.
     Local,
+    /// Remote call over REST.
     Rest,
+    /// Remote call over gRPC.
     Grpc,
 }
 
@@ -88,17 +104,28 @@ impl Parse for ProvidesAttr {
                 "missing required arg `contract = path::to::TraitName`",
             )
         })?;
-        let local = local.ok_or_else(|| {
-            syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "missing required arg `local = path::to::factory_fn`",
-            )
-        })?;
+        let transports = transports.unwrap_or_else(|| vec![Transport::Local]);
+        match (&local, transports.contains(&Transport::Local)) {
+            (None, true) => {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "missing required arg `local = path::to::factory_fn` \
+                     (required when `transports` includes `local`)",
+                ));
+            }
+            (Some(_), false) => {
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "`local = ...` is given but `transports` excludes `local`",
+                ));
+            }
+            _ => {}
+        }
 
         Ok(Self {
             contract,
             local,
-            transports: transports.unwrap_or_else(|| vec![Transport::Local]),
+            transports,
             rest_client,
             grpc_client,
             ir_fn,
@@ -241,7 +268,7 @@ pub fn generate(attr: &ProvidesAttr, item: &ItemStruct) -> SynResult<TokenStream
         )
     });
 
-    let local_path = &attr.local;
+    let local_path = attr.local.as_ref();
     let transports = &attr.transports;
     let enable_local = transports.contains(&Transport::Local);
     let enable_rest = transports.contains(&Transport::Rest);
@@ -302,7 +329,7 @@ pub fn generate(attr: &ProvidesAttr, item: &ItemStruct) -> SynResult<TokenStream
     };
 
     // Build the match arms based on enabled transports.
-    let local_arm = if enable_local {
+    let local_arm = if let (true, Some(local_path)) = (enable_local, local_path) {
         quote! {
             ::toolkit_contract::wiring::ClientWiring::Local => {
                 let __policies = #policy_stack_expr;
@@ -442,3 +469,45 @@ pub fn generate(attr: &ProvidesAttr, item: &ItemStruct) -> SynResult<TokenStream
 
 // `parent_module` / `append_segment` now live in `crate::support` (shared with
 // `consumes.rs`).
+
+#[cfg(test)]
+mod tests {
+    use super::{ProvidesAttr, Transport};
+
+    fn parse(args: &str) -> syn::Result<ProvidesAttr> {
+        syn::parse_str(args)
+    }
+
+    #[test]
+    fn local_is_required_when_transports_include_it() {
+        let err = parse("contract = sdk::Api")
+            .err()
+            .expect("no local factory");
+        assert!(
+            err.to_string().contains("missing required arg `local"),
+            "{err}"
+        );
+        let err = parse("contract = sdk::Api, transports = [local, grpc]")
+            .err()
+            .expect("local listed, no factory");
+        assert!(
+            err.to_string().contains("missing required arg `local"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn local_is_refused_when_transports_exclude_it() {
+        let err = parse("contract = sdk::Api, local = make, transports = [grpc]")
+            .err()
+            .expect("a factory nothing calls");
+        assert!(err.to_string().contains("excludes `local`"), "{err}");
+    }
+
+    #[test]
+    fn a_remote_only_provider_needs_no_local_factory() {
+        let attr = parse("contract = sdk::Api, transports = [grpc]").expect("parses");
+        assert!(attr.local.is_none());
+        assert!(attr.transports == [Transport::Grpc]);
+    }
+}

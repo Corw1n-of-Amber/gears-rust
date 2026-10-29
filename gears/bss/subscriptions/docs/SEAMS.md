@@ -81,7 +81,7 @@
 | **SUB-C1** | HIGH | **Joint (RISK — contracts gear first draft)** | **Renewal / grace ladder / regional templates.** §6.5 assumes Contracts is the SoR for `Renewal` (`autoRenew`, term windows, notice), grace length/ladder, and regional templates (S:674, S:718). Upstream Contracts PRD has not authored them (S:1360). **Until authored:** the platform defaults govern — **7-day grace**, **30/14/7/1 notices**, hybrid exit trigger (S:722–725). Subscriptions stores **evaluated fields** at renewal-evaluation time for replay. Cross-PRD obligation on Contracts to author the SoR; Subscriptions consumes via events + read models. **Update 2026-09-29:** the contracts gear (first draft, 2026-08-17) now authors `fr-renewal-terms` and `fr-grace-regional` but has no acceptance criteria. The PRD treats the platform defaults as a first-class state for uncontracted subscriptions, with provenance and an explicit-binding rule ([`PRD.md`](./PRD.md) §6.5 `fr-platform-defaults`); the in-flight-term migration rule and the effect of contract termination/expiry are open (PRD §15). |
 | **SUB-C2** | MED | **Joint** | **Ramps (committed multi-step schedules).** Contracts authors the committed ramp; Subscriptions **executes** it as a sequence of scheduled `changePlan`/`updateQuantity` intents (**SUB-D-04**, S:630). No native `SubscriptionSchedule` aggregate at launch. **Open:** atomic multi-action submission (Zuora-Orders-style) is a Contracts/Design follow-up (S:1342). Depends on the SUB-D-01/02 intent envelopes. |
 | **SUB-C3** | MED | **SUB-adopts (owner = Contracts)** | **Commitment pools.** Committed-usage pools are **Contracts SoR**, true-up is **rating** (rating **T-D-14**, rating SEAMS **M8**; S:181). This gear keeps **subscription-side hooks only** — it neither owns the pool balance nor computes the true-up. Adopt the owner split; expose the subscription linkage. |
-| **SUB-C4** | MED | **Joint** | **Activation date-trio + acceptance.** `contractEffectiveAt` (booking) is **referenced from the Contract** — booking semantics stay Contracts/Finance SoR; `serviceActivatedAt` is stamped at the `activate` commit here; `customerAcceptedAt` is stamped by an optional **acceptance confirmation** where Contract clauses require it, else = service activation (**SUB-D-05**, S:500). **No new statuses.** All three ride lifecycle events + ASC hooks. **Open:** the confirmation-flow shape (who confirms, evidence) is design (S:1343). |
+| **SUB-C4** | MED | **Joint** | **Activation date-trio + acceptance.** `contractEffectiveAt` (booking) is **referenced from the Contract** — booking semantics stay Contracts/Finance SoR; `serviceActivatedAt` is the `activate` commit instant, assigned once the required readiness confirmations are in; the OSS outcome time is evidence only (Orders D-217); `customerAcceptedAt` is stamped by an optional **acceptance confirmation** where Contract clauses require it, else = service activation (**SUB-D-05**, S:500). **No new statuses.** All three ride lifecycle events + ASC hooks. **Open:** the confirmation-flow shape (who confirms, evidence) is design (S:1343). |
 | **SUB-C5** | MED | **SUB-adopts** | **`PriceOverride` windows.** Contracts supplies negotiated override windows consumed via events/read models; in rating these are the **step-5 contract overlay** (rating `04-overlays-precedence`, precedence Contract > Partner PriceOverlay > Catalog base). Subscriptions references the override binding for composition/renewal; it does not evaluate the override. |
 
 ## D. Billing & Invoicing
@@ -180,6 +180,8 @@
 | **CHG-S3** | HIGH | **Adopted** | **Overlap self-exemption** for the subscription being changed; the rule still holds against every other subscription. ([`PRD.md`](./PRD.md) §6.3 Overlapping subscriptions, AC 40.) |
 | **CHG-S4** | MED | **Adopted** | **Composition read with revision** for the Orders delta gate (`getComposition`). ([`PRD.md`](./PRD.md) §6.3 `fr-composite-change`, §9.1.) |
 | **CHG-S5** | MED | **Adopted** | **Requested effective date** honoured as the item's future `changeEffectiveAt`, held as a scheduled change intent (SUB-D-01/SUB-D-04) — no new `changeMode` value; default at application; this gear owns the boundary, proration trigger and billing consequences; past dates rejected. Multi-date change intents vs all-or-nothing are open ([`PRD.md`](./PRD.md) §15, §6.3 `fr-composite-change` item 4). |
+
+**Orders seam naming reconciliation (S1-01):** use the [source-qualified semantic alias map](../../orders/docs/UPSTREAM_REQS.md#subscription-seam-alias-map) when joining these obligations to Lifecycle or Workflow. Bare SUB-O numbers are not cross-document API identities; existing IDs and unresolved delivery status are preserved.
 
 ---
 
@@ -302,3 +304,18 @@
 (§5.1/§6/§12/§15) and [`DECISIONS.md`](./DECISIONS.md). This seam map is the input to
 the design set — each slice implements the Subscriptions side of the seams listed for it in
 [`DESIGN.md`](./DESIGN.md) §1.3.
+
+
+### Lifecycle D-201 receiver amendments
+
+The receiver contract matrix preserves historical
+SUB-O aliases and names each semantic operation. All activation writers (direct, Orders,
+resume, transfer and key-changing plan change) obey the shared capacity/fence protocol.
+An Orders draft rebuild requires the [engine-issued successor](../../orders/docs/DESIGN.md#contract-06-replace-fulfillment-grant);
+closed generations never reopen and completed members are not recreated. Intent admission and
+applied confirmation use the [separate clock contract](../../orders/docs/DESIGN.md#contract-06-activation-clocks):
+the actual service start is this gear's `activate` commit instant (`serviceActivatedAt`, SUB-D-05);
+the OSS outcome time is evidence only (Orders D-217).
+Hold pauses pending confirmation; it preserves already active service. Late OSS effects remain
+reconcilable with uncertain claims retained. These are normative receiver requirements;
+provider SDK implementation and deployed conformance remain separate delivery work.
