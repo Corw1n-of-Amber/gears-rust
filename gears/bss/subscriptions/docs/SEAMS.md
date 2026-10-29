@@ -234,7 +234,7 @@
 | Notice/win-back **delivery** | **Notifications/Comms** | SUB-F2 |
 | `catalogSubscriptionProductKey` / published SKU/`CatalogVersion` | **Registry** (Product & SKU) | SUB-G1, SUB-G2 |
 | Mid-term cancellation money path (facts / terms / artifacts) | **Subscriptions** (facts + reason class) / **Contracts** (ETF terms) / **Billing** (materialises) | SUB-B7 |
-| One-time / setup charge (emission / valuation) | **Subscriptions** (amount-less fact + lifetime dedup) / **Billing** (values from the frozen ref, posts) | SUB-B8 |
+| One-time / setup charge (emission / valuation) | **Subscriptions** (amount-less fact, deduplicated per phase-entry occurrence — SUB-D-28) / **Billing** (values from the frozen ref, posts) | SUB-B8 |
 | Plan migration (authoring / execution) | **Pricing** (authors, state machine, exclusion set) / **Subscriptions** (executes batches, reports) | SUB-P7 |
 | Per-scope-key in-flight-subscriber presence | **Subscriptions** (data source; presence read) — pricing consumes fail-closed | SUB-P8 |
 | Billing terms (cycle, anchor, UTC) / clamp execution | **Subscriptions** (`BillingTerms`, PRD §1.4; Pricing publishes no anchor policy since 2026-10-08, rating T-D-07) | SUB-P9 |

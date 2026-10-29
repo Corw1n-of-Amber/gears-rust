@@ -156,7 +156,7 @@ The predecessor additionally carried the **entitlement framework** (feature flag
 | **Subscription pause** | Temporary pause preserving subscription state with no charges during the pause window — distinct from suspension (service-affecting). Modeled as the **`collectionPaused`** posture on `active` (§6.4, SUB-D-03). |
 | **Subscription revision** | Monotonic `version` (and/or revision record) capturing **effective-dated** composition and commercial snapshot pointers after a committed transition. |
 | **Trial period** | Time-limited free or reduced-cost period modeled as the leading plan phase (§6.1); runtime, conversion, expiry, and extension in §6.10. |
-| **Usage attribution binding** | Effective-dated link from a provisioned resource or subject to the subscription component that provisioned it, born at provisioning confirmation and closed at deprovision; the source Rating uses to attribute usage records, which carry no commercial identity (§6.2, `fr-usage-attribution`). |
+| **Usage attribution binding** | Effective-dated link from a provisioned resource or subject to the subscription component that provisioned it, born at provisioning confirmation (for a resource adopted by an import, at the import instant — §6.1 `fr-import`) and closed at deprovision; the source Rating uses to attribute usage records, which carry no commercial identity (§6.2, `fr-usage-attribution`). |
 | **Usage quota** | Numeric entitlement defining maximum allowed usage (e.g. 100 GB storage, 1000 API calls/month); counted by the platform `quota-enforcement` gear against the limit License Manager provisions from the subscription's posture (§6.9). |
 
 ## 2. Architecture Alignment
@@ -479,7 +479,7 @@ Manifest `Subscription.status` is **`draft` | `active` | `suspended` | `cancelle
         └──┬────┬──┘
            │    │ cancel (void — SUB-D-11)
   activate │    └─────────────────────────────────────────┐
-  (Policy+OSS+entitlements)                               │
+  (Policy+OSS)                                            │
            ▼                                              │
         ┌──────────┐      suspend       ┌───────────┐     │
         │  active  │───────────────────▶│ suspended │     │
@@ -607,7 +607,7 @@ A service provider moving onto the platform brings live subscriptions from its p
 1. **State as found.** An import creates the subscription directly in `active` or `suspended` — a creation edge outside the `draft → activate` pair, tracked for manifest alignment (§15) — carrying the original start, the current term window and term sequence, the billing anchor, the instant the legacy system has billed through, the composition (plan, add-ons, quantities), the price it is billed at (a catalog price or a contract override), and any trial or grace position. This is the one place where a start instant is supplied by the caller (§6.1 `fr-order-originated-create` item 5 does not apply).
 2. **Adopt, never provision.** Existing resources are **adopted**: the import lists their references, they are validated against the OSS inventory, and they open the usage attribution binding (§6.2 `fr-usage-attribution`) from the import instant. No provisioning work order runs. Entitlements are issued to match the imported composition; the Policy Engine pre-check applies as for activation.
 3. **No double billing.** No one-time or setup fact is emitted for an imported component, and the first recurring fact starts at the legacy billed-through instant; that instant also seeds the backdating guard (§6.3 `fr-backdated-changes`).
-4. **Provenance and idempotency.** The subscription records `imported` provenance with the source system and its legacy identifier; an import is idempotent on `(source system, legacy identifier)`.
+4. **Provenance and idempotency.** The subscription records `imported` provenance with the source system and its legacy identifier; an import is idempotent on `(orderingTenantId, source system, legacy identifier)`, tenant-scoped like `create` (§4.1): a legacy identifier is unique only within one provider's billing system.
 5. **Batch.** Imports run in batches with a per-item outcome; one failing item never blocks the rest.
 6. **Who.** Import is a system or operator operation, never customer-facing, and every import is audited.
 
@@ -840,7 +840,7 @@ The inverse of suspension MUST also be representable: a **`collectionPaused`** p
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-subscriptions-fr-renewal-evaluation`
 
-The bound Contract is the source — the contracts gear authors `autoRenew`, the renewal term window and the notice ladder (`fr-renewal-terms`); for an uncontracted subscription the platform defaults are (`fr-platform-defaults`). **Evergreen** and **notice periods** are called out as manifest risks — notice/opt-out behavior MUST be defined in the contract templates and in the platform defaults alike. The Subscriptions **renewal job** evaluates `endDate` / term, emits the **renewal attempted** outcome; on success it extends the term; on failure it triggers the **failed renewal** path. **Every successful renewal — auto and manual alike — re-resolves the pricing-side snapshot refs eligibility-first** (SUB-D-14 as amended 2026-07-28): a non-grandfathered subscription re-binds to the current eligible row (supersessions propagate at renewal); a **grandfathered** subscription keeps its pinned generation — the refresh carries `priceEligibility` + `cohort` forward — and re-binds away **only at the first renewal after its generation's `grandfatherUntil` has passed** (pricing's `EligibilityExpirySignal`). A subscription with **`autoRenew = false`**, no pending intent, and no manual `renew` at `endDate` ends by a system-derived **end-of-term cancel** (reason `term_expired`; SUB-D-13) — it never lingers `active` unbilled.
+The bound Contract is the source — the contracts gear authors `autoRenew`, the renewal term window and the notice ladder (`fr-renewal-terms`); for an uncontracted subscription, term and auto-renewal resolve per `fr-term-source` (the order line's term, otherwise the platform default) and the notice ladder comes from the platform defaults (`fr-platform-defaults`). **Evergreen** and **notice periods** are called out as manifest risks — notice/opt-out behavior MUST be defined in the contract templates and in the platform defaults alike. The Subscriptions **renewal job** evaluates `endDate` / term, emits the **renewal attempted** outcome; on success it extends the term; on failure it triggers the **failed renewal** path. **Every successful renewal — auto and manual alike — re-resolves the pricing-side snapshot refs eligibility-first** (SUB-D-14 as amended 2026-07-28): a non-grandfathered subscription re-binds to the current eligible row (supersessions propagate at renewal); a **grandfathered** subscription keeps its pinned generation — the refresh carries `priceEligibility` + `cohort` forward — and re-binds away **only at the first renewal after its generation's `grandfatherUntil` has passed** (pricing's `EligibilityExpirySignal`). A subscription with **`autoRenew = false`**, no pending intent, and no manual `renew` at `endDate` ends by a system-derived **end-of-term cancel** (reason `term_expired`; SUB-D-13) — it never lingers `active` unbilled.
 
 **Rationale**: Renewal is Contract-driven; Subscriptions executes and audits it.
 
@@ -1274,7 +1274,7 @@ For the intents of §6.1 `fr-intent-protocol`, this gear MUST publish a p95 and 
 | **Operation** | **Verb(s)** | **Idempotency / concurrency (requirements)** |
 |---------------|-------------|-----------------------------------------------|
 | create | `create` | Caller-supplied **idempotency key**, deduped on `(orderingTenantId, operation, key)` (§4.1); optional **order reference** and the line's add-on selection (§6.1 `fr-order-originated-create`); optional term, auto-renewal flag and **co-term date** (§6.5) |
-| import (system / operator) | `import` | idempotent on `(source system, legacy identifier)`; batch with per-item outcome; adopts listed resources, no provisioning, no one-time fact (§6.1 `fr-import`) |
+| import (system / operator) | `import` | idempotent on `(orderingTenantId, source system, legacy identifier)`; batch with per-item outcome; adopts listed resources, no provisioning, no one-time fact (§6.1 `fr-import`) |
 | get / list | `get`, `list` | — |
 | activate / suspend / resume / cancel | `activate`, `suspend`, `resume`, `cancel` | **Idempotency key** + **optimistic concurrency** on subscription **version** (Design maps to concrete headers); the start is the `activate` commit instant, never order- or caller-supplied (the import mode is the only exception); `cancel` carries `cancelMode` and a reason from the closed set (§6.1 `fr-cancel-reasons`); `suspend` MAY carry `resumeAt` (§6.1) |
 | plan change | `changePlan` | same |
@@ -1698,9 +1698,9 @@ For the intents of §6.1 `fr-intent-protocol`, this gear MUST publish a p95 and 
 - **Then** `SubscriptionRenewalNoticeDue` MUST carry `priceChangePending = true`, derived from the pricing lookahead inputs (scheduled `PriceWindow`s + the generation's `grandfatherUntil` date), with no amount computed in this gear
 
 **34. ETF derivation is reason-scoped and joins on the carried keys** *(SUB-D-18/25; added 2026-08-01)*
-- **Given** cancellations with reasons `customer`, `term_expired`, and `nonpayment_exhausted`
+- **Given** cancellations with each closed reason: `customer`, `operator`, `term_expired`, `nonpayment_exhausted`, `saga_superseded`, and `order_compensation`
 - **When** Billing derives the Contracts-defined commercial consequence from `SubscriptionCancelled`
-- **Then** only the `customer` (and `operator`) cancel MAY yield an ETF or unused-portion credit; `term_expired`, `nonpayment_exhausted`, `saga_superseded`, and `order_compensation` MUST NOT
+- **Then** only a `customer` or `operator` cancel MAY yield an ETF or unused-portion credit; `term_expired`, `nonpayment_exhausted`, `saga_superseded`, and `order_compensation` MUST NOT
 - **And** the derivation MUST join on the event's term window + billing-period identity, never re-reading the aggregate at posting time
 
 ### Orders, contracts, and usage attribution
@@ -1818,7 +1818,7 @@ For the intents of §6.1 `fr-intent-protocol`, this gear MUST publish a p95 and 
 - **When** it is imported
 - **Then** it MUST be created `active` with its original start and current term, adopting the listed resources with no provisioning work order
 - **And** no one-time or setup fact MUST be emitted, and the first recurring fact MUST start at the billed-through instant
-- **And** importing the same legacy identifier again MUST return the existing subscription
+- **And** importing the same legacy identifier again for the same ordering tenant MUST return the existing subscription, while the same identifier imported for another ordering tenant MUST create a separate subscription
 
 ### Service readiness
 
